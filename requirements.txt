@@ -4,3 +4,4 @@ requests==2.31.0
 web3==7.6.0
 eth-account==0.13.7
 gunicorn==21.2.0
+websocket-client==1.8.0
