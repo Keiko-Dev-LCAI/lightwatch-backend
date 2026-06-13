@@ -135,8 +135,21 @@ class AIVMClient:
                                  timeout=15)
         r2.raise_for_status()
         data = r2.json()
-        self._jwt     = data["token"]
-        self._jwt_exp = data.get("expiresAt", time.time() + 3600)
+        self._jwt = data["token"]
+        # expiresAt may be an ISO string, Unix seconds, or Unix ms — handle all
+        exp_raw = data.get("expiresAt", 0)
+        if isinstance(exp_raw, str):
+            try:
+                from datetime import datetime
+                self._jwt_exp = datetime.fromisoformat(exp_raw.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                self._jwt_exp = time.time() + 3600
+        elif isinstance(exp_raw, (int, float)) and exp_raw > 1e12:
+            self._jwt_exp = float(exp_raw) / 1000   # milliseconds → seconds
+        elif isinstance(exp_raw, (int, float)) and exp_raw > 1e9:
+            self._jwt_exp = float(exp_raw)           # already Unix seconds
+        else:
+            self._jwt_exp = time.time() + 3600
         print(f"  [AIVM] JWT refreshed")
 
     def run_inference(self, prompt: str, timeout_secs: int = 300) -> str:
@@ -437,10 +450,12 @@ def generate_report():
     if not data:
         return jsonify({"error": "No data"}), 400
 
-    company     = data.get("company", "Unknown")
-    industry    = data.get("industry", "General")
+    # Accept either {company, industry, data:{...}} or {entity:{name, industry, ...}, report_type}
+    entity      = data.get("entity", {})
+    company     = data.get("company", entity.get("name", "Unknown"))
+    industry    = data.get("industry", entity.get("industry", "General"))
     report_type = data.get("report_type", "exec")
-    company_data = data.get("data", {})
+    company_data = data.get("data", entity)   # fall back to entity block
 
     audience_map = {
         "bank":      "a bank loan officer reviewing creditworthiness and operational stability",
@@ -489,7 +504,7 @@ Keep it concise and factual. Today's date: {time.strftime('%B %d, %Y')}."""
     except Exception as e:
         print(f"[report] AIVM error: {e}")
         return jsonify({"report": f"Report generation unavailable. Please review the dashboard data directly. Error: {str(e)}",
-                        "source": "error"})
+                        "source": "error", "fallback": True})
 
 
 # ── QUICKBOOKS OAuth ─────────────────────────────────────────────────────────
