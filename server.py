@@ -100,6 +100,21 @@ def _init_db():
                 uploaded_at TEXT    DEFAULT (datetime('now'))
             )
         """)
+        # Migrate: add calendar date columns to existing orders table
+        for _col, _typ in [("delivery_date", "TEXT"), ("arrival_date", "TEXT")]:
+            try:
+                conn.execute(f"ALTER TABLE gb_orders ADD COLUMN {_col} {_typ}")
+            except Exception:
+                pass  # column already exists
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS gb_blocked_days (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                date       TEXT    NOT NULL UNIQUE,
+                reason     TEXT    DEFAULT 'closed',
+                note       TEXT,
+                created_at TEXT    DEFAULT (datetime('now'))
+            )
+        """)
         conn.commit()
 
 try:
@@ -781,8 +796,8 @@ def gb_create_order():
         with _db() as conn:
             cur = conn.execute(
                 "INSERT INTO gb_orders "
-                "(customer_name, phone, items, manufacturer, total_amount, deposit_paid, expected_date, status, notes) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
+                "(customer_name, phone, items, manufacturer, total_amount, deposit_paid, expected_date, delivery_date, status, notes) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (str(data.get("customer_name") or "Unknown")[:200],
                  str(data.get("phone") or "")[:50],
                  items_str,
@@ -790,6 +805,7 @@ def gb_create_order():
                  float(data.get("total_amount") or 0),
                  float(data.get("deposit_paid") or 0),
                  str(data.get("expected_date") or "")[:50],
+                 str(data.get("delivery_date") or "")[:50],
                  str(data.get("status") or "Ordered")[:50],
                  str(data.get("notes") or "")[:500])
             )
@@ -808,7 +824,7 @@ def gb_update_order(order_id):
     try:
         _init_db()
         allowed = ["customer_name", "phone", "manufacturer", "total_amount",
-                   "deposit_paid", "expected_date", "status", "notes"]
+                   "deposit_paid", "expected_date", "delivery_date", "status", "notes"]
         fields, vals = [], []
         for k in allowed:
             if k in data:
@@ -1067,6 +1083,87 @@ def gb_attention():
         "stats": {"total": len(orders), "overdue": len(overdue),
                   "ready": len(ready), "balance_due": round(balance_due, 2)},
     })
+
+
+# ── GREAT BRIDGE FURNITURE — DELIVERY CALENDAR ───────────────────────────────
+
+@app.route("/api/gb/calendar", methods=["GET"])
+def gb_calendar():
+    """Return all calendar events (deliveries, arrivals, blocked days) for a month."""
+    import calendar as _cal
+    year  = request.args.get("year",  type=int) or datetime.now().year
+    month = request.args.get("month", type=int) or datetime.now().month
+    _, dim = _cal.monthrange(year, month)
+    start = f"{year}-{month:02d}-01"
+    end   = f"{year}-{month:02d}-{dim:02d}"
+    try:
+        _init_db()
+        with _db() as conn:
+            # Outgoing: orders with a scheduled delivery date
+            deliveries = conn.execute(
+                "SELECT id, customer_name, phone, items, delivery_date, status FROM gb_orders "
+                "WHERE delivery_date BETWEEN ? AND ? AND delivery_date != ''",
+                (start, end)).fetchall()
+            # Incoming: orders expected to arrive from manufacturer
+            arrivals = conn.execute(
+                "SELECT id, customer_name, manufacturer, items, expected_date, status FROM gb_orders "
+                "WHERE expected_date BETWEEN ? AND ? AND expected_date != ''",
+                (start, end)).fetchall()
+            # Blocked days
+            blocked = conn.execute(
+                "SELECT * FROM gb_blocked_days WHERE date BETWEEN ? AND ?",
+                (start, end)).fetchall()
+        return jsonify({
+            "deliveries": [dict(r) for r in deliveries],
+            "arrivals":   [dict(r) for r in arrivals],
+            "blocked":    [dict(r) for r in blocked]
+        })
+    except Exception as e:
+        print(f"[gb/calendar] {e}")
+        return jsonify({"deliveries": [], "arrivals": [], "blocked": [], "error": str(e)}), 500
+
+
+@app.route("/api/gb/blocked-days", methods=["GET", "POST"])
+def gb_blocked_days():
+    """List or add blocked days (store closed, vacation, holiday)."""
+    if request.method == "GET":
+        try:
+            _init_db()
+            with _db() as conn:
+                rows = conn.execute("SELECT * FROM gb_blocked_days ORDER BY date").fetchall()
+            return jsonify({"blocked": [dict(r) for r in rows]})
+        except Exception as e:
+            return jsonify({"blocked": [], "error": str(e)}), 500
+    # POST — add a blocked day
+    data   = request.get_json(force=True) or {}
+    date   = str(data.get("date", "")).strip()
+    reason = str(data.get("reason", "closed")).strip()
+    note   = str(data.get("note", "")).strip()
+    if not date:
+        return jsonify({"error": "date required"}), 400
+    try:
+        _init_db()
+        with _db() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO gb_blocked_days (date, reason, note) VALUES (?,?,?)",
+                (date, reason, note))
+            conn.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/gb/blocked-days/<int:day_id>", methods=["DELETE"])
+def gb_blocked_day_delete(day_id):
+    """Remove a blocked day."""
+    try:
+        _init_db()
+        with _db() as conn:
+            conn.execute("DELETE FROM gb_blocked_days WHERE id = ?", (day_id,))
+            conn.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ── GREAT BRIDGE FURNITURE — DOCUMENT ATTACHMENTS ────────────────────────────
