@@ -115,6 +115,22 @@ def _init_db():
                 created_at TEXT    DEFAULT (datetime('now'))
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS gb_deliveries (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                date        TEXT    NOT NULL,
+                time        TEXT    DEFAULT '',
+                direction   TEXT    DEFAULT 'OUT',
+                name        TEXT    NOT NULL DEFAULT '',
+                address     TEXT    DEFAULT '',
+                phone       TEXT    DEFAULT '',
+                items       TEXT    DEFAULT '',
+                notes       TEXT    DEFAULT '',
+                order_id    INTEGER,
+                created_at  TEXT    DEFAULT (datetime('now')),
+                updated_at  TEXT    DEFAULT (datetime('now'))
+            )
+        """)
         conn.commit()
 
 try:
@@ -1113,10 +1129,15 @@ def gb_calendar():
             blocked = conn.execute(
                 "SELECT * FROM gb_blocked_days WHERE date BETWEEN ? AND ?",
                 (start, end)).fetchall()
+            # Standalone calendar delivery events (with times)
+            events = conn.execute(
+                "SELECT * FROM gb_deliveries WHERE date BETWEEN ? AND ? ORDER BY date, time",
+                (start, end)).fetchall()
         return jsonify({
             "deliveries": [dict(r) for r in deliveries],
             "arrivals":   [dict(r) for r in arrivals],
-            "blocked":    [dict(r) for r in blocked]
+            "blocked":    [dict(r) for r in blocked],
+            "events":     [dict(r) for r in events],
         })
     except Exception as e:
         print(f"[gb/calendar] {e}")
@@ -1163,6 +1184,98 @@ def gb_blocked_day_delete(day_id):
             conn.commit()
         return jsonify({"ok": True})
     except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ── GREAT BRIDGE FURNITURE — DELIVERY CALENDAR EVENTS ───────────────────────
+
+@app.route("/api/gb/deliveries", methods=["GET"])
+def gb_get_deliveries():
+    """Get delivery events. Pass ?date=YYYY-MM-DD for a single day, or omit for all."""
+    date = request.args.get("date", "").strip()
+    try:
+        _init_db()
+        with _db() as conn:
+            if date:
+                rows = conn.execute(
+                    "SELECT * FROM gb_deliveries WHERE date = ? ORDER BY time, id",
+                    (date,)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM gb_deliveries ORDER BY date, time, id").fetchall()
+        return jsonify({"deliveries": [dict(r) for r in rows]})
+    except Exception as e:
+        print(f"[gb/deliveries GET] {e}")
+        return jsonify({"deliveries": [], "error": str(e)}), 500
+
+
+@app.route("/api/gb/deliveries", methods=["POST"])
+def gb_create_delivery():
+    """Create a standalone calendar delivery event."""
+    data = request.get_json(force=True) or {}
+    if not str(data.get("date", "")).strip():
+        return jsonify({"error": "date is required"}), 400
+    if not str(data.get("name", "")).strip():
+        return jsonify({"error": "name is required"}), 400
+    try:
+        _init_db()
+        with _db() as conn:
+            cur = conn.execute(
+                "INSERT INTO gb_deliveries (date, time, direction, name, address, phone, items, notes, order_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (str(data.get("date",      ""))[:20],
+                 str(data.get("time",      ""))[:10],
+                 str(data.get("direction", "OUT"))[:5],
+                 str(data.get("name",      ""))[:200],
+                 str(data.get("address",   ""))[:500],
+                 str(data.get("phone",     ""))[:50],
+                 str(data.get("items",     ""))[:500],
+                 str(data.get("notes",     ""))[:500],
+                 data.get("order_id") or None)
+            )
+            conn.commit()
+        return jsonify({"ok": True, "id": cur.lastrowid})
+    except Exception as e:
+        print(f"[gb/deliveries POST] {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/gb/deliveries/<int:del_id>", methods=["PUT"])
+def gb_update_delivery(del_id):
+    """Update a delivery event."""
+    data    = request.get_json(force=True) or {}
+    allowed = ["date","time","direction","name","address","phone","items","notes","order_id"]
+    fields, vals = [], []
+    for k in allowed:
+        if k in data:
+            fields.append(f"{k} = ?")
+            vals.append(data[k])
+    if not fields:
+        return jsonify({"error": "Nothing to update"}), 400
+    fields.append("updated_at = datetime('now')")
+    vals.append(del_id)
+    try:
+        _init_db()
+        with _db() as conn:
+            conn.execute(f"UPDATE gb_deliveries SET {', '.join(fields)} WHERE id = ?", vals)
+            conn.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        print(f"[gb/deliveries PUT {del_id}] {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/gb/deliveries/<int:del_id>", methods=["DELETE"])
+def gb_delete_delivery(del_id):
+    """Delete a delivery event."""
+    try:
+        _init_db()
+        with _db() as conn:
+            conn.execute("DELETE FROM gb_deliveries WHERE id = ?", (del_id,))
+            conn.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        print(f"[gb/deliveries DELETE {del_id}] {e}")
         return jsonify({"error": str(e)}), 500
 
 
