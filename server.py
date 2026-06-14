@@ -19,6 +19,7 @@ Env vars required (set in Railway):
 
 import os, json, time, threading, secrets as _secrets_mod
 import base64 as _b64_mod
+import sqlite3, io, csv as _csv_mod, re as _re_mod
 from flask import Flask, request, jsonify, session, redirect
 from flask_cors import CORS
 import requests as req
@@ -62,6 +63,40 @@ QB_API_BASE      = "https://quickbooks.api.intuit.com/v3/company"
 # In-memory token store (Railway volume would persist across restarts)
 _QB_TOKENS = {}   # { realm_id: {access_token, refresh_token, expires_at} }
 _QB_LOCK   = threading.Lock()
+
+# ── GREAT BRIDGE FURNITURE — SQLite DB ───────────────────────────────────────
+DB_PATH = os.environ.get("DB_PATH", "/tmp/lightview.db")
+
+def _db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def _init_db():
+    with _db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS gb_orders (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                customer_name  TEXT,
+                phone          TEXT,
+                items          TEXT,
+                manufacturer   TEXT,
+                total_amount   REAL    DEFAULT 0,
+                deposit_paid   REAL    DEFAULT 0,
+                expected_date  TEXT,
+                status         TEXT    DEFAULT 'Ordered',
+                notes          TEXT,
+                created_at     TEXT    DEFAULT (datetime('now')),
+                updated_at     TEXT    DEFAULT (datetime('now'))
+            )
+        """)
+        conn.commit()
+
+try:
+    _init_db()
+    print("[DB] SQLite initialized")
+except Exception as _e:
+    print(f"[DB] init failed: {_e}")
 
 # ── AIVM HELPERS ─────────────────────────────────────────────────────────────
 
@@ -682,6 +717,330 @@ def contact():
     use_case = str(data.get("use_case", ""))[:500].strip()
     print(f"[DEMO REQUEST] Company: {company!r} | Industry: {industry!r} | Use case: {use_case!r}")
     return jsonify({"ok": True})
+
+
+# ── GREAT BRIDGE FURNITURE — ORDER ENDPOINTS ─────────────────────────────────
+
+@app.route("/api/gb/orders", methods=["GET"])
+def gb_get_orders():
+    """Return all orders sorted: Ready for Pickup first, then Ordered, In Transit, etc."""
+    try:
+        _init_db()
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM gb_orders ORDER BY "
+                "CASE status "
+                "  WHEN 'Ready for Pickup' THEN 1 "
+                "  WHEN 'Ordered'          THEN 2 "
+                "  WHEN 'In Transit'       THEN 3 "
+                "  WHEN 'Received'         THEN 4 "
+                "  WHEN 'Delivered'        THEN 5 "
+                "  WHEN 'Paid'             THEN 6 "
+                "  ELSE 7 END, created_at DESC"
+            ).fetchall()
+        return jsonify({"orders": [dict(r) for r in rows]})
+    except Exception as e:
+        print(f"[gb/orders GET] {e}")
+        return jsonify({"error": str(e), "orders": []}), 500
+
+
+@app.route("/api/gb/orders", methods=["POST"])
+def gb_create_order():
+    """Create a single order from the manual entry form."""
+    data = request.get_json(force=True) or {}
+    try:
+        _init_db()
+        items = data.get("items", [])
+        items_str = json.dumps(items) if isinstance(items, list) else str(items)
+        with _db() as conn:
+            cur = conn.execute(
+                "INSERT INTO gb_orders "
+                "(customer_name, phone, items, manufacturer, total_amount, deposit_paid, expected_date, status, notes) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (str(data.get("customer_name") or "Unknown")[:200],
+                 str(data.get("phone") or "")[:50],
+                 items_str,
+                 str(data.get("manufacturer") or "")[:200],
+                 float(data.get("total_amount") or 0),
+                 float(data.get("deposit_paid") or 0),
+                 str(data.get("expected_date") or "")[:50],
+                 str(data.get("status") or "Ordered")[:50],
+                 str(data.get("notes") or "")[:500])
+            )
+            conn.commit()
+            new_id = cur.lastrowid
+        return jsonify({"ok": True, "id": new_id})
+    except Exception as e:
+        print(f"[gb/orders POST] {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/gb/orders/<int:order_id>", methods=["PUT"])
+def gb_update_order(order_id):
+    """Update any fields on an existing order (e.g. status change)."""
+    data = request.get_json(force=True) or {}
+    try:
+        _init_db()
+        allowed = ["customer_name", "phone", "manufacturer", "total_amount",
+                   "deposit_paid", "expected_date", "status", "notes"]
+        fields, vals = [], []
+        for k in allowed:
+            if k in data:
+                fields.append(f"{k} = ?")
+                vals.append(data[k])
+        if "items" in data:
+            fields.append("items = ?")
+            vals.append(json.dumps(data["items"]) if isinstance(data["items"], list) else str(data["items"]))
+        if not fields:
+            return jsonify({"error": "Nothing to update"}), 400
+        fields.append("updated_at = datetime('now')")
+        vals.append(order_id)
+        with _db() as conn:
+            conn.execute(f"UPDATE gb_orders SET {', '.join(fields)} WHERE id = ?", vals)
+            conn.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        print(f"[gb/orders PUT {order_id}] {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/gb/orders/save-import", methods=["POST"])
+def gb_save_import():
+    """Batch-save orders that came back from the AIVM import preview."""
+    data   = request.get_json(force=True) or {}
+    orders = data.get("orders", [])
+    if not orders:
+        return jsonify({"error": "No orders to save"}), 400
+    try:
+        _init_db()
+        saved = 0
+        with _db() as conn:
+            for o in orders:
+                items_str = json.dumps(o.get("items", [])) if isinstance(o.get("items"), list) else str(o.get("items") or "")
+                try:
+                    total   = float(str(o.get("total_amount")   or "0").replace("$","").replace(",",""))
+                    deposit = float(str(o.get("deposit_paid")   or "0").replace("$","").replace(",",""))
+                except Exception:
+                    total = deposit = 0
+                conn.execute(
+                    "INSERT INTO gb_orders "
+                    "(customer_name, phone, items, manufacturer, total_amount, deposit_paid, expected_date, status, notes) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (str(o.get("customer_name") or "Unknown")[:200],
+                     str(o.get("phone") or "")[:50],
+                     items_str,
+                     str(o.get("manufacturer") or "")[:200],
+                     total, deposit,
+                     str(o.get("expected_date") or "")[:50],
+                     str(o.get("status") or "Ordered")[:50],
+                     str(o.get("notes") or "")[:500])
+                )
+                saved += 1
+            conn.commit()
+        return jsonify({"ok": True, "saved": saved})
+    except Exception as e:
+        print(f"[gb/orders/save-import] {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/gb/import", methods=["POST"])
+def gb_import_spreadsheet():
+    """Upload CSV or Excel → AIVM reads it → returns JSON orders array for preview."""
+    if 'file' not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    f     = request.files['file']
+    fname = (f.filename or "").lower()
+
+    raw_rows = []
+    try:
+        content = f.read()
+        if fname.endswith('.csv'):
+            text   = content.decode('utf-8', errors='replace')
+            reader = _csv_mod.DictReader(io.StringIO(text))
+            for row in reader:
+                raw_rows.append({k: str(v) for k, v in row.items() if v is not None})
+                if len(raw_rows) >= 300:
+                    break
+        elif fname.endswith(('.xlsx', '.xls')):
+            import openpyxl
+            wb      = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+            ws      = wb.active
+            headers = None
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                if i == 0:
+                    headers = [str(h).strip() if h is not None else f"col{j}" for j, h in enumerate(row)]
+                elif not all(v is None for v in row):
+                    raw_rows.append({
+                        headers[j]: str(v).strip() if v is not None else ""
+                        for j, v in enumerate(row) if j < len(headers)
+                    })
+                if i >= 300:
+                    break
+            wb.close()
+        else:
+            return jsonify({"error": "Please upload a .csv or .xlsx file"}), 400
+    except Exception as e:
+        return jsonify({"error": f"Could not read file: {e}"}), 400
+
+    if not raw_rows:
+        return jsonify({"error": "File is empty or has no readable rows"}), 400
+
+    headers_found = list(raw_rows[0].keys()) if raw_rows else []
+    sample        = raw_rows[:60]
+    rows_text     = "\n".join(
+        " | ".join(f"{k}: {v}" for k, v in row.items() if v and v != 'None')
+        for row in sample
+    )
+
+    prompt = (
+        "You are analyzing a spreadsheet from Great Bridge Furniture, a furniture store in Chesapeake Virginia.\n"
+        f"The spreadsheet has these column headers: {', '.join(headers_found)}\n"
+        f"Here are the rows (up to 60 shown):\n{rows_text}\n\n"
+        "Extract every customer order you can find. For each distinct customer order, create one JSON entry with these fields:\n"
+        "  customer_name (string), phone (string), items (array of strings), manufacturer (string),\n"
+        "  total_amount (number, dollars), deposit_paid (number, dollars),\n"
+        "  expected_date (YYYY-MM-DD string or null), status (one of: Ordered / In Transit / Received / Ready for Pickup / Delivered / Paid),\n"
+        "  notes (string)\n"
+        "Respond with ONLY a valid JSON array — no other text, no markdown, no code blocks."
+    )
+
+    aivm_result = None
+    try:
+        aivm = get_aivm()
+        if aivm:
+            aivm_result = aivm.run_inference(prompt, timeout_secs=300)
+            clean = _re_mod.sub(r'```(?:json)?\s*|\s*```', '', aivm_result).strip()
+            match = _re_mod.search(r'\[.*\]', clean, _re_mod.DOTALL)
+            orders = json.loads(match.group()) if match else json.loads(clean)
+            if not isinstance(orders, list):
+                orders = []
+            return jsonify({
+                "orders": orders,
+                "rows_scanned": len(raw_rows),
+                "orders_found": len(orders),
+                "source": "AIVM",
+                "headers": headers_found,
+            })
+    except json.JSONDecodeError:
+        return jsonify({
+            "orders": [],
+            "rows_scanned": len(raw_rows),
+            "raw_response": (aivm_result or "")[:800],
+            "source": "parse_error",
+            "headers": headers_found,
+            "error": "AIVM returned something that wasn't valid JSON — check raw_response",
+        }), 200
+    except Exception as e:
+        print(f"[gb/import AIVM] {e}")
+        return jsonify({
+            "orders": [],
+            "rows_scanned": len(raw_rows),
+            "headers": headers_found,
+            "error": str(e),
+            "source": "aivm_error",
+        })
+
+
+@app.route("/api/gb/attention", methods=["GET"])
+def gb_attention():
+    """AIVM morning briefing — what needs attention today at Great Bridge Furniture."""
+    try:
+        _init_db()
+        with _db() as conn:
+            rows = conn.execute("SELECT * FROM gb_orders ORDER BY created_at DESC").fetchall()
+        orders = [dict(r) for r in rows]
+    except Exception as e:
+        orders = []
+
+    today = time.strftime('%Y-%m-%d')
+
+    if not orders:
+        return jsonify({
+            "attention": "No orders in the system yet. Import your spreadsheet or add your first order to get started.",
+            "source": "empty"
+        })
+
+    # Build context for AIVM
+    status_counts = {}
+    overdue       = []
+    ready         = []
+    balance_due   = 0.0
+
+    for o in orders:
+        s = o.get('status', 'Ordered')
+        status_counts[s] = status_counts.get(s, 0) + 1
+        exp = o.get('expected_date', '')
+        if exp and exp < today and s not in ['Delivered', 'Paid']:
+            overdue.append(o)
+        if s == 'Ready for Pickup':
+            ready.append(o)
+        try:
+            balance_due += float(o.get('total_amount') or 0) - float(o.get('deposit_paid') or 0)
+        except Exception:
+            pass
+
+    context = (
+        f"Today is {today}. Great Bridge Furniture has {len(orders)} total orders.\n"
+        f"Status breakdown: {json.dumps(status_counts)}\n"
+        f"Orders overdue (past expected date, not yet delivered): {len(overdue)}\n"
+        f"Orders ready for pickup: {len(ready)}\n"
+        f"Total outstanding balance: ${balance_due:,.2f}\n\n"
+    )
+    if overdue:
+        context += "Overdue orders:\n" + "\n".join(
+            f"  - {o['customer_name']} ({o.get('manufacturer','?')}), expected {o.get('expected_date','?')}, status: {o.get('status','?')}"
+            for o in overdue[:10]
+        ) + "\n"
+    if ready:
+        context += "Ready for pickup:\n" + "\n".join(
+            f"  - {o['customer_name']} ({o.get('manufacturer','?')}) — call to schedule delivery"
+            for o in ready[:10]
+        ) + "\n"
+
+    prompt = (
+        context +
+        "\nYou are the AI assistant for Great Bridge Furniture. Write a short morning briefing (3-5 bullet points) "
+        "for the store owner. Focus on what needs action today: overdue orders, ready-for-pickup customers to call, "
+        "upcoming expected deliveries, and any patterns worth noting. Be direct and practical. "
+        "Format as plain bullet points starting with •"
+    )
+
+    aivm_text = None
+    try:
+        aivm = get_aivm()
+        if aivm:
+            aivm_text = aivm.run_inference(prompt, timeout_secs=120)
+            return jsonify({"attention": aivm_text.strip(), "source": "AIVM",
+                            "stats": {"total": len(orders), "overdue": len(overdue),
+                                      "ready": len(ready), "balance_due": round(balance_due, 2)}})
+    except Exception as e:
+        print(f"[gb/attention AIVM] {e}")
+
+    # Rule-based fallback
+    lines = []
+    if ready:
+        names = ", ".join(o['customer_name'] for o in ready[:5])
+        lines.append(f"• {len(ready)} order(s) ready for pickup — call to schedule: {names}")
+    if overdue:
+        names = ", ".join(o['customer_name'] for o in overdue[:5])
+        lines.append(f"• {len(overdue)} order(s) past expected date — follow up with manufacturer: {names}")
+    ordered_count = status_counts.get('Ordered', 0)
+    if ordered_count:
+        lines.append(f"• {ordered_count} order(s) placed and waiting on manufacturers")
+    transit_count = status_counts.get('In Transit', 0)
+    if transit_count:
+        lines.append(f"• {transit_count} order(s) in transit — check for arrival today")
+    if balance_due > 0:
+        lines.append(f"• Outstanding balance to collect: ${balance_due:,.2f}")
+    if not lines:
+        lines.append("• All orders are on track — nothing urgent today")
+
+    return jsonify({
+        "attention": "\n".join(lines),
+        "source": "rule-based",
+        "stats": {"total": len(orders), "overdue": len(overdue),
+                  "ready": len(ready), "balance_due": round(balance_due, 2)},
+    })
 
 
 # ── MAIN ─────────────────────────────────────────────────────────────────────
