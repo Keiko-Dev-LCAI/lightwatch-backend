@@ -145,6 +145,16 @@ def _init_db():
                 updated_at     TEXT    DEFAULT (datetime('now'))
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS gb_activity_log (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_name  TEXT    NOT NULL DEFAULT 'Unknown',
+                action     TEXT    NOT NULL DEFAULT '',
+                target     TEXT    DEFAULT '',
+                details    TEXT    DEFAULT '',
+                created_at TEXT    DEFAULT (datetime('now'))
+            )
+        """)
         conn.commit()
 
 try:
@@ -152,6 +162,20 @@ try:
     print("[DB] SQLite initialized")
 except Exception as _e:
     print(f"[DB] init failed: {_e}")
+
+
+def _log_activity(user: str, action: str, target: str = "", details: str = ""):
+    """Append one row to gb_activity_log (fire-and-forget, never raises)."""
+    try:
+        with _db() as conn:
+            conn.execute(
+                "INSERT INTO gb_activity_log (user_name, action, target, details) VALUES (?,?,?,?)",
+                (str(user or "Unknown")[:100], str(action)[:200],
+                 str(target)[:200], str(details)[:500])
+            )
+            conn.commit()
+    except Exception as _e:
+        print(f"[activity_log] {_e}")
 
 # ── AIVM HELPERS ─────────────────────────────────────────────────────────────
 
@@ -819,16 +843,18 @@ def gb_get_orders():
 def gb_create_order():
     """Create a single order from the manual entry form."""
     data = request.get_json(force=True) or {}
+    user = str(data.get("user_name") or "Unknown")[:100]
     try:
         _init_db()
         items = data.get("items", [])
         items_str = json.dumps(items) if isinstance(items, list) else str(items)
+        customer  = str(data.get("customer_name") or "Unknown")[:200]
         with _db() as conn:
             cur = conn.execute(
                 "INSERT INTO gb_orders "
                 "(customer_name, phone, items, manufacturer, total_amount, deposit_paid, expected_date, delivery_date, status, notes) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (str(data.get("customer_name") or "Unknown")[:200],
+                (customer,
                  str(data.get("phone") or "")[:50],
                  items_str,
                  str(data.get("manufacturer") or "")[:200],
@@ -841,6 +867,9 @@ def gb_create_order():
             )
             conn.commit()
             new_id = cur.lastrowid
+        items_preview = ", ".join(items[:2]) if isinstance(items, list) else str(items)[:60]
+        _log_activity(user, "Added order", f"#{new_id}",
+                      f"Customer: {customer} — Items: {items_preview[:80]}")
         return jsonify({"ok": True, "id": new_id})
     except Exception as e:
         print(f"[gb/orders POST] {e}")
@@ -851,6 +880,7 @@ def gb_create_order():
 def gb_update_order(order_id):
     """Update any fields on an existing order (e.g. status change)."""
     data = request.get_json(force=True) or {}
+    user = str(data.get("user_name") or "Unknown")[:100]
     try:
         _init_db()
         allowed = ["customer_name", "phone", "manufacturer", "total_amount",
@@ -867,12 +897,49 @@ def gb_update_order(order_id):
             return jsonify({"error": "Nothing to update"}), 400
         fields.append("updated_at = datetime('now')")
         vals.append(order_id)
+        # Fetch customer name for the log
         with _db() as conn:
+            row = conn.execute("SELECT customer_name FROM gb_orders WHERE id=?", (order_id,)).fetchone()
+            customer = row["customer_name"] if row else "?"
             conn.execute(f"UPDATE gb_orders SET {', '.join(fields)} WHERE id = ?", vals)
             conn.commit()
+        # Log a meaningful description of what changed
+        if "status" in data:
+            _log_activity(user, "Changed status to",
+                          f"\"{data['status']}\"",
+                          f"Order #{order_id} — {customer}")
+        else:
+            changed = [k for k in allowed if k in data] + (["items"] if "items" in data else [])
+            _log_activity(user, "Updated order", f"#{order_id}",
+                          f"Customer: {customer} — Fields: {', '.join(changed)}")
         return jsonify({"ok": True})
     except Exception as e:
         print(f"[gb/orders PUT {order_id}] {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/gb/orders/<int:order_id>", methods=["DELETE"])
+def gb_delete_order(order_id):
+    """Delete an order and its docs. Logs who deleted it."""
+    data = request.get_json(force=True) or {}
+    user = str(data.get("user_name") or "Unknown")[:100]
+    try:
+        _init_db()
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT customer_name FROM gb_orders WHERE id=?", (order_id,)
+            ).fetchone()
+            if not row:
+                return jsonify({"error": "Order not found"}), 404
+            customer = row["customer_name"]
+            conn.execute("DELETE FROM gb_docs WHERE order_id=?", (order_id,))
+            conn.execute("DELETE FROM gb_orders WHERE id=?", (order_id,))
+            conn.commit()
+        _log_activity(user, "Deleted order", f"#{order_id}",
+                      f"Customer: {customer}")
+        return jsonify({"ok": True})
+    except Exception as e:
+        print(f"[gb/orders DELETE {order_id}] {e}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -881,6 +948,7 @@ def gb_save_import():
     """Batch-save orders that came back from the AIVM import preview."""
     data   = request.get_json(force=True) or {}
     orders = data.get("orders", [])
+    user   = str(data.get("user_name") or "Unknown")[:100]
     if not orders:
         return jsonify({"error": "No orders to save"}), 400
     try:
@@ -909,6 +977,8 @@ def gb_save_import():
                 )
                 saved += 1
             conn.commit()
+        _log_activity(user, "Imported orders via spreadsheet", "",
+                      f"{saved} orders added to system")
         return jsonify({"ok": True, "saved": saved})
     except Exception as e:
         print(f"[gb/orders/save-import] {e}")
@@ -1344,18 +1414,23 @@ def gb_upload_doc(order_id):
     if ext not in allowed_ext:
         return jsonify({"error": f"File type not allowed: {ext}"}), 400
 
+    user = request.form.get("user_name") or request.args.get("user_name") or "Unknown"
     try:
         filedata = f.read()
         if len(filedata) > 20 * 1024 * 1024:   # 20 MB cap
             return jsonify({"error": "File too large (20 MB max)"}), 400
         _init_db()
         with _db() as conn:
+            row = conn.execute("SELECT customer_name FROM gb_orders WHERE id=?", (order_id,)).fetchone()
+            customer = row["customer_name"] if row else "?"
             cur = conn.execute(
                 "INSERT INTO gb_docs (order_id, filename, filetype, filedata) VALUES (?,?,?,?)",
                 (order_id, filename, filetype, filedata)
             )
             conn.commit()
             doc_id = cur.lastrowid
+        _log_activity(user, "Attached document", f"to order #{order_id}",
+                      f"File: {filename} — Customer: {customer}")
         return jsonify({"ok": True, "doc_id": doc_id, "filename": filename})
     except Exception as e:
         print(f"[gb/docs POST order={order_id}] {e}")
@@ -1975,6 +2050,163 @@ def biz_onboard():
             print(f"[biz/onboard] profile parse error: {e}")
 
     return jsonify({"reply": reply_text, "done": done, "profile": profile})
+
+
+# ── GREAT BRIDGE FURNITURE — ACTIVITY LOG ────────────────────────────────────
+
+@app.route("/api/gb/activity", methods=["GET"])
+def gb_activity_log():
+    """Return the employee activity log.
+    Optional query params:
+      limit  — max rows (default 200, max 500)
+      offset — skip N rows for pagination (default 0)
+      user   — filter by user_name (case-insensitive)
+      q      — search text across action/target/details
+    """
+    try:
+        limit  = min(int(request.args.get("limit",  200)), 500)
+        offset = int(request.args.get("offset", 0))
+        user_f = (request.args.get("user") or "").strip()
+        q      = (request.args.get("q")    or "").strip().lower()
+        _init_db()
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM gb_activity_log ORDER BY id DESC LIMIT 1000"
+            ).fetchall()
+        log = [dict(r) for r in rows]
+        # Client-side filter (log rarely exceeds a few thousand rows)
+        if user_f:
+            log = [r for r in log if r.get("user_name", "").lower() == user_f.lower()]
+        if q:
+            log = [r for r in log
+                   if q in (r.get("action","") + " " +
+                             r.get("target","") + " " +
+                             r.get("details","")).lower()]
+        total = len(log)
+        log   = log[offset: offset + limit]
+        return jsonify({"log": log, "total": total})
+    except Exception as e:
+        print(f"[gb/activity] {e}")
+        return jsonify({"log": [], "total": 0, "error": str(e)}), 500
+
+
+# ── GREAT BRIDGE FURNITURE — CUSTOMER SEARCH ─────────────────────────────────
+
+@app.route("/api/gb/search", methods=["GET"])
+def gb_customer_search():
+    """
+    Partial-name customer search across gb_orders.
+    Query param: q — partial name (e.g. "jones")
+    Returns unique customer cards with order count, phone, last order date,
+    and latest expected date.
+    """
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"customers": [], "error": "q param required"}), 400
+    try:
+        _init_db()
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT customer_name, phone, status, expected_date, created_at "
+                "FROM gb_orders WHERE LOWER(customer_name) LIKE ? "
+                "ORDER BY created_at DESC",
+                (f"%{q.lower()}%",)
+            ).fetchall()
+        # Group by lowercase name in Python — clean deduplication
+        groups = {}
+        for r in rows:
+            key = r["customer_name"].lower().strip()
+            if key not in groups:
+                groups[key] = {
+                    "name":          r["customer_name"],
+                    "phone":         r["phone"] or "",
+                    "order_count":   0,
+                    "last_order_at": r["created_at"] or "",
+                    "latest_eta":    "",
+                    "has_pending":   False,
+                }
+            g = groups[key]
+            g["order_count"] += 1
+            # Keep most-recent phone if we have one
+            if r["phone"] and not g["phone"]:
+                g["phone"] = r["phone"]
+            # Track the furthest-out expected date
+            exp = r["expected_date"] or ""
+            if exp and exp > g["latest_eta"]:
+                g["latest_eta"] = exp
+            # Flag if any order is still open
+            if r["status"] not in ("Delivered", "Paid"):
+                g["has_pending"] = True
+
+        customers = sorted(
+            groups.values(),
+            key=lambda x: x["last_order_at"],
+            reverse=True
+        )
+        return jsonify({"customers": customers, "query": q})
+    except Exception as e:
+        print(f"[gb/search] {e}")
+        return jsonify({"customers": [], "error": str(e)}), 500
+
+
+@app.route("/api/gb/customers", methods=["GET"])
+def gb_customer_profile():
+    """
+    Full customer profile by name.
+    Query param: name — customer name (matched case-insensitively)
+    Returns all orders, pending orders with ETAs, delivery history,
+    doc counts per order, and outstanding balance.
+    """
+    name = (request.args.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name param required"}), 400
+    try:
+        _init_db()
+        with _db() as conn:
+            orders = conn.execute(
+                "SELECT * FROM gb_orders "
+                "WHERE LOWER(customer_name) = LOWER(?) "
+                "ORDER BY created_at DESC",
+                (name,)
+            ).fetchall()
+            # Doc counts for each matching order
+            doc_rows = conn.execute(
+                "SELECT order_id, COUNT(*) as doc_count FROM gb_docs "
+                "WHERE order_id IN "
+                "  (SELECT id FROM gb_orders WHERE LOWER(customer_name) = LOWER(?)) "
+                "GROUP BY order_id",
+                (name,)
+            ).fetchall()
+
+        doc_counts   = {r["order_id"]: r["doc_count"] for r in doc_rows}
+        orders_list  = []
+        total_balance = 0.0
+
+        for o in orders:
+            d = dict(o)
+            d["doc_count"] = doc_counts.get(o["id"], 0)
+            try:
+                total_balance += float(o["total_amount"] or 0) - float(o["deposit_paid"] or 0)
+            except Exception:
+                pass
+            orders_list.append(d)
+
+        pending   = [o for o in orders_list if o.get("status") not in ("Delivered", "Paid")]
+        delivered = [o for o in orders_list if o.get("status") in ("Delivered", "Paid")]
+        phone     = orders_list[0]["phone"] if orders_list else ""
+
+        return jsonify({
+            "name":         name,
+            "phone":        phone,
+            "order_count":  len(orders_list),
+            "orders":       orders_list,
+            "pending":      pending,
+            "delivered":    delivered,
+            "balance_due":  round(total_balance, 2),
+        })
+    except Exception as e:
+        print(f"[gb/customers] {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 # ── MAIN ─────────────────────────────────────────────────────────────────────
