@@ -131,6 +131,20 @@ def _init_db():
                 updated_at  TEXT    DEFAULT (datetime('now'))
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS biz_profile (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                company        TEXT    NOT NULL UNIQUE,
+                business_type  TEXT    DEFAULT '',
+                priorities     TEXT    DEFAULT '[]',
+                briefing_focus TEXT    DEFAULT '',
+                staff_notes    TEXT    DEFAULT '',
+                summary        TEXT    DEFAULT '',
+                raw_conv       TEXT    DEFAULT '',
+                created_at     TEXT    DEFAULT (datetime('now')),
+                updated_at     TEXT    DEFAULT (datetime('now'))
+            )
+        """)
         conn.commit()
 
 try:
@@ -1055,13 +1069,42 @@ def gb_attention():
             for o in ready[:10]
         ) + "\n"
 
-    prompt = (
-        context +
-        "\nYou are the AI assistant for Great Bridge Furniture. Write a short morning briefing (3-5 bullet points) "
-        "for the store owner. Focus on what needs action today: overdue orders, ready-for-pickup customers to call, "
-        "upcoming expected deliveries, and any patterns worth noting. Be direct and practical. "
-        "Format as plain bullet points starting with •"
-    )
+    # Read business profile for personalization
+    biz_profile_obj = None
+    try:
+        with _db() as conn:
+            bp_row = conn.execute(
+                "SELECT * FROM biz_profile WHERE company = ?", ("GB",)
+            ).fetchone()
+        if bp_row:
+            biz_profile_obj = dict(bp_row)
+            try:
+                biz_profile_obj["priorities"] = json.loads(biz_profile_obj.get("priorities") or "[]")
+            except Exception:
+                biz_profile_obj["priorities"] = []
+    except Exception:
+        pass
+
+    if biz_profile_obj and biz_profile_obj.get("priorities"):
+        priority_str = ", ".join(biz_profile_obj["priorities"][:3])
+        focus_str    = biz_profile_obj.get("briefing_focus", "")
+        profile_note = f"The owner's top priorities are: {priority_str}. {focus_str}".strip()
+        prompt = (
+            context +
+            f"\nOwner profile: {profile_note}\n"
+            "\nYou are the AI assistant for Great Bridge Furniture. Write a short morning briefing (3-5 bullet points) "
+            "for the store owner. Lead with what matters most to them based on their stated priorities. "
+            "Focus on what needs action today. Be direct and practical. "
+            "Format as plain bullet points starting with •"
+        )
+    else:
+        prompt = (
+            context +
+            "\nYou are the AI assistant for Great Bridge Furniture. Write a short morning briefing (3-5 bullet points) "
+            "for the store owner. Focus on what needs action today: overdue orders, ready-for-pickup customers to call, "
+            "upcoming expected deliveries, and any patterns worth noting. Be direct and practical. "
+            "Format as plain bullet points starting with •"
+        )
 
     aivm_text = None
     try:
@@ -1730,6 +1773,208 @@ def gb_restructure_sheets():
         as_attachment=True,
         download_name=filename
     )
+
+
+# ── BUSINESS PROFILE — AIVM ONBOARDING ──────────────────────────────────────
+
+@app.route("/api/biz/profile", methods=["GET"])
+def biz_get_profile():
+    """Return the biz_profile for a company, or null if not yet set.
+    Query param: company=GB
+    """
+    company = (request.args.get("company") or "").strip().upper()
+    if not company:
+        return jsonify({"error": "company required"}), 400
+    try:
+        _init_db()
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT * FROM biz_profile WHERE company = ?", (company,)
+            ).fetchone()
+        if not row:
+            return jsonify({"profile": None})
+        p = dict(row)
+        try:
+            p["priorities"] = json.loads(p.get("priorities") or "[]")
+        except Exception:
+            p["priorities"] = []
+        return jsonify({"profile": p})
+    except Exception as e:
+        print(f"[biz/profile GET] {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/biz/profile", methods=["DELETE"])
+def biz_delete_profile():
+    """Delete (reset) the biz_profile for a company so onboarding can run again.
+    Query param: company=GB
+    """
+    company = (request.args.get("company") or "").strip().upper()
+    if not company:
+        return jsonify({"error": "company required"}), 400
+    try:
+        _init_db()
+        with _db() as conn:
+            conn.execute("DELETE FROM biz_profile WHERE company = ?", (company,))
+            conn.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        print(f"[biz/profile DELETE] {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+_ONBOARD_SYSTEM = (
+    "You are LightView's friendly business assistant having a short setup conversation with a business owner. "
+    "Your goal is to understand their business and what matters most to them each day.\n\n"
+    "Ask warm, plain-English questions — no jargon, no forms, no bullet points in your questions. "
+    "After 4-5 exchanges, give a short confirmation of what you learned, then — and only then — "
+    "output the profile on its own final line.\n\n"
+    "Rules:\n"
+    "- Keep each reply to 2-3 short sentences max\n"
+    "- Ask exactly one question at a time\n"
+    "- Use simple, friendly conversational language — imagine talking to a neighbor\n"
+    "- Only output PROFILE_JSON: after the owner has confirmed your summary\n"
+    "- When ready, output this as the very last line of your reply:\n"
+    'PROFILE_JSON:{"business_type":"...","priorities":["...","...","..."],'
+    '"briefing_focus":"...","staff_notes":"...","summary":"..."}\n\n'
+    "Field definitions:\n"
+    "- business_type: short label (e.g. furniture store, restaurant, medical office)\n"
+    "- priorities: top 3 things the owner cares about most each day\n"
+    "- briefing_focus: one sentence — what should the morning briefing lead with\n"
+    "- staff_notes: brief note on staff structure if mentioned\n"
+    "- summary: 2-sentence plain-English description of this business and their needs"
+)
+
+
+def _save_biz_profile(company: str, profile: dict, messages: list):
+    """Persist a biz_profile row to the DB (upsert)."""
+    try:
+        _init_db()
+        priorities_json = json.dumps(profile.get("priorities", []))
+        raw_conv        = json.dumps(messages)
+        with _db() as conn:
+            conn.execute("""
+                INSERT INTO biz_profile
+                    (company, business_type, priorities, briefing_focus, staff_notes, summary, raw_conv, updated_at)
+                VALUES (?,?,?,?,?,?,?, datetime('now'))
+                ON CONFLICT(company) DO UPDATE SET
+                    business_type  = excluded.business_type,
+                    priorities     = excluded.priorities,
+                    briefing_focus = excluded.briefing_focus,
+                    staff_notes    = excluded.staff_notes,
+                    summary        = excluded.summary,
+                    raw_conv       = excluded.raw_conv,
+                    updated_at     = datetime('now')
+            """, (
+                company,
+                str(profile.get("business_type", ""))[:200],
+                priorities_json,
+                str(profile.get("briefing_focus", ""))[:500],
+                str(profile.get("staff_notes", ""))[:500],
+                str(profile.get("summary", ""))[:1000],
+                raw_conv
+            ))
+            conn.commit()
+        print(f"[biz_profile] saved for {company}")
+    except Exception as e:
+        print(f"[biz_profile] save error: {e}")
+
+
+@app.route("/api/biz/onboard", methods=["POST"])
+def biz_onboard():
+    """
+    Multi-turn AIVM onboarding conversation.
+    Body: { company: str, messages: [{role: "user"|"assistant", content: str}] }
+    Returns: { reply: str, done: bool, profile?: {...} }
+    """
+    data     = request.get_json(force=True) or {}
+    company  = str(data.get("company") or "GB").strip().upper()
+    messages = data.get("messages", [])
+
+    if not messages:
+        return jsonify({"error": "messages array required"}), 400
+
+    # Build the full conversation prompt for AIVM (system + all prior turns)
+    conv_text = _ONBOARD_SYSTEM + "\n\n"
+    for m in messages:
+        role    = m.get("role", "user")
+        content = str(m.get("content", "")).strip()
+        if role == "user":
+            conv_text += f"Owner: {content}\n"
+        else:
+            conv_text += f"Assistant: {content}\n"
+    conv_text += "Assistant:"
+
+    reply_text = None
+    try:
+        aivm      = get_aivm()
+        raw       = aivm.run_inference(conv_text, timeout_secs=120).strip()
+        # Trim echoed prefix if AIVM repeated the cue
+        for prefix in ("assistant:", "lightview ai:", "lightview assistant:"):
+            if raw.lower().startswith(prefix):
+                raw = raw[len(prefix):].strip()
+                break
+        reply_text = raw
+    except Exception as e:
+        print(f"[biz/onboard AIVM] {e}")
+
+    # Rule-based fallback when AIVM is unavailable
+    if not reply_text:
+        user_count = sum(1 for m in messages if m.get("role") == "user")
+        if user_count == 1:
+            reply_text = (
+                "Thanks for telling me about your business! "
+                "What's the hardest part of your day to keep track of — "
+                "is it knowing what's coming in, what's going out to customers, "
+                "who owes you money, or something else?"
+            )
+        elif user_count == 2:
+            reply_text = (
+                "That makes a lot of sense. "
+                "Do you have staff who help run things, and do they all need to "
+                "see everything or just certain parts of the business?"
+            )
+        else:
+            # Build a basic profile and wrap up
+            basic_profile = {
+                "business_type": company,
+                "priorities":    ["orders", "deliveries", "outstanding balances"],
+                "briefing_focus": "Lead with any overdue orders and customers ready for pickup.",
+                "staff_notes":   "Not specified during setup.",
+                "summary":       f"Business at {company}. Owner wants a clear daily picture of orders, deliveries, and who owes money."
+            }
+            _save_biz_profile(company, basic_profile, messages)
+            return jsonify({
+                "reply": (
+                    "Got it — I’ve set up your dashboard based on what you’ve shared with me. "
+                    "You can always update this from Settings if your needs change."
+                ),
+                "done":    True,
+                "profile": basic_profile
+            })
+
+    # Check for PROFILE_JSON: marker in the AIVM reply
+    profile = None
+    done    = False
+    profile_match = _re_mod.search(
+        r'PROFILE_JSON:\s*(\{.*?\})\s*$', reply_text, _re_mod.DOTALL | _re_mod.MULTILINE
+    )
+    if profile_match:
+        try:
+            profile    = json.loads(profile_match.group(1))
+            # Remove the PROFILE_JSON line from the visible reply
+            reply_text = reply_text[:profile_match.start()].strip()
+            if not reply_text:
+                reply_text = (
+                    "Perfect — I’ve got everything I need. "
+                    "Your dashboard is now personalised for your business."
+                )
+            _save_biz_profile(company, profile, messages)
+            done = True
+        except Exception as e:
+            print(f"[biz/onboard] profile parse error: {e}")
+
+    return jsonify({"reply": reply_text, "done": done, "profile": profile})
 
 
 # ── MAIN ─────────────────────────────────────────────────────────────────────
