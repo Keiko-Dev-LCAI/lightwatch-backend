@@ -669,6 +669,21 @@ def qb_data():
         return jsonify({"error": str(e)}), 500
 
 
+# ── Contact / Demo Request ───────────────────────────────────────────────────
+@app.route("/api/contact", methods=["POST"])
+def contact():
+    """
+    Body: { company: str, industry: str, use_case: str }
+    Logs the demo request to Railway stdout.
+    """
+    data     = request.get_json(force=True) or {}
+    company  = str(data.get("company",  ""))[:200].strip()
+    industry = str(data.get("industry", ""))[:100].strip()
+    use_case = str(data.get("use_case", ""))[:500].strip()
+    print(f"[DEMO REQUEST] Company: {company!r} | Industry: {industry!r} | Use case: {use_case!r}")
+    return jsonify({"ok": True})
+
+
 # ── MAIN ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
