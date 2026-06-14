@@ -1548,7 +1548,7 @@ def gb_analyze_sheets():
     combined_text = "\n\n---\n\n".join(all_file_summaries)
 
     if len(all_file_summaries) == 1:
-        fname = all_file_summaries[0].get("filename", "the file")
+        fname = all_file_summaries[0].split('\n')[0].replace('FILE: ', '').strip()
         prompt = (
             "You are analyzing a spreadsheet uploaded by Great Bridge Furniture, a furniture store in Chesapeake Virginia.\n"
             f"They have uploaded one file: {fname}\n\n"
