@@ -2590,6 +2590,362 @@ def gb_customer_profile():
         return jsonify({"error": str(e)}), 500
 
 
+# ── GREAT BRIDGE FURNITURE — ASK AIVM CHAT ───────────────────────────────────
+
+@app.route("/api/gb/ask", methods=["POST"])
+def gb_ask():
+    """
+    Chat endpoint with live business context injection.
+    Body: { message, messages (array), file_b64, file_mime, file_name }
+    Returns: { reply: "..." }
+    """
+    data      = request.get_json(force=True) or {}
+    message   = str(data.get("message", "")).strip()
+    messages  = data.get("messages", [])   # prior conversation turns
+    file_b64  = data.get("file_b64")       # optional base64 attachment
+    file_mime = str(data.get("file_mime", "")).lower()
+    file_name = str(data.get("file_name", ""))
+
+    if not message:
+        return jsonify({"error": "message required"}), 400
+
+    today = time.strftime('%Y-%m-%d')
+
+    # ── Fetch live context ──────────────────────────────────────────────────
+    try:
+        _init_db()
+        with _db() as conn:
+            orders = conn.execute(
+                "SELECT * FROM gb_orders WHERE created_at >= date('now','-90 days') "
+                "ORDER BY created_at DESC"
+            ).fetchall()
+            orders_list = [dict(r) for r in orders]
+
+            inv_rows = conn.execute(
+                "SELECT status, COUNT(*) as cnt FROM gb_inventory GROUP BY status"
+            ).fetchall()
+            inv_summary = {r["status"]: r["cnt"] for r in inv_rows}
+
+            activity = conn.execute(
+                "SELECT user_name, action, target, details, created_at "
+                "FROM gb_activity_log ORDER BY created_at DESC LIMIT 20"
+            ).fetchall()
+            activity_list = [dict(r) for r in activity]
+    except Exception as e:
+        print(f"[gb/ask] DB error: {e}")
+        orders_list   = []
+        inv_summary   = {}
+        activity_list = []
+
+    # ── Compute key metrics ─────────────────────────────────────────────────
+    status_counts = {}
+    overdue       = []
+    ready         = []
+    balance_due   = 0.0
+    for o in orders_list:
+        s = o.get("status", "Ordered")
+        status_counts[s] = status_counts.get(s, 0) + 1
+        exp = o.get("expected_date", "")
+        if exp and exp < today and s not in ("Delivered", "Paid"):
+            overdue.append(o)
+        if s == "Ready for Pickup":
+            ready.append(o)
+        try:
+            balance_due += float(o.get("total_amount") or 0) - float(o.get("deposit_paid") or 0)
+        except Exception:
+            pass
+
+    orders_slim = []
+    for o in orders_list[:60]:
+        orders_slim.append({
+            "id":            o.get("id"),
+            "customer":      o.get("customer_name"),
+            "items":         o.get("items"),
+            "manufacturer":  o.get("manufacturer"),
+            "status":        o.get("status"),
+            "expected_date": o.get("expected_date"),
+            "balance":       round(float(o.get("total_amount") or 0) - float(o.get("deposit_paid") or 0), 2),
+        })
+
+    system_ctx = (
+        f"You are AIVM, the AI business assistant for Great Bridge Furniture, a furniture store "
+        f"in Chesapeake VA (1325 S Battlefield Blvd, 757-482-6622). Today is {today}.\n\n"
+        f"LIVE BUSINESS DATA:\n"
+        f"Orders (last 90 days): {len(orders_list)} total\n"
+        f"Status breakdown: {json.dumps(status_counts)}\n"
+        f"Overdue (past expected date, not yet delivered): {len(overdue)}\n"
+        f"Ready for pickup: {len(ready)}\n"
+        f"Outstanding balance: ${balance_due:,.2f}\n"
+        f"Inventory by status: {json.dumps(inv_summary)}\n\n"
+        f"Order details (most recent 60):\n{json.dumps(orders_slim, indent=2)}\n\n"
+        f"Recent activity (last 20):\n{json.dumps(activity_list, indent=2)}\n\n"
+        f"Answer David's questions directly and helpfully. Be specific — use the actual data. "
+        f"Offer practical business advice. Keep answers concise but complete.\n"
+    )
+
+    # ── Handle file attachment ──────────────────────────────────────────────
+    file_section = ""
+    if file_b64:
+        if "image" in file_mime:
+            file_section = (
+                f"\n[The owner has attached an image named '{file_name}'. "
+                f"Analyze it in the context of their question. "
+                f"Describe what you can infer and how it relates to their business.]\n"
+            )
+        else:
+            try:
+                import base64 as _b64
+                raw = _b64.b64decode(file_b64)
+                fn_lower = file_name.lower()
+                if fn_lower.endswith(".csv") or "csv" in file_mime:
+                    text  = raw.decode("utf-8", errors="replace")
+                    lines = text.split("\n")[:60]
+                    file_section = (
+                        f"\n[The owner has attached a CSV file named '{file_name}'. "
+                        f"First 60 rows:\n" + "\n".join(lines) + "\n]\n"
+                    )
+                elif fn_lower.endswith((".xlsx", ".xls")):
+                    try:
+                        import openpyxl as _xl
+                        wb = _xl.load_workbook(io.BytesIO(raw), data_only=True)
+                        ws = wb.active
+                        rows_txt = []
+                        for row in ws.iter_rows(max_row=60, values_only=True):
+                            rows_txt.append("\t".join("" if c is None else str(c) for c in row))
+                        file_section = (
+                            f"\n[The owner has attached a spreadsheet named '{file_name}'. "
+                            f"First 60 rows:\n" + "\n".join(rows_txt) + "\n]\n"
+                        )
+                    except Exception as ex:
+                        file_section = f"\n[Spreadsheet '{file_name}' could not be parsed: {ex}]\n"
+                else:
+                    file_section = f"\n[The owner has attached a file named '{file_name}'.]\n"
+            except Exception as ex:
+                file_section = f"\n[File '{file_name}' could not be processed: {ex}]\n"
+
+    # ── Build single prompt string ──────────────────────────────────────────
+    conv_lines = []
+    for m in messages[-8:]:
+        role    = m.get("role", "user")
+        content = m.get("content", "")
+        conv_lines.append(("User" if role == "user" else "Assistant") + ": " + content)
+    conv_lines.append("User: " + message)
+
+    full_prompt = system_ctx + file_section + "\nConversation:\n" + "\n".join(conv_lines) + "\n\nAssistant:"
+
+    try:
+        aivm  = get_aivm()
+        reply = aivm.run_inference(full_prompt, timeout_secs=180)
+        return jsonify({"reply": reply.strip()})
+    except Exception as e:
+        print(f"[gb/ask] AIVM error: {e}")
+        # ── Rule-based fallback ───────────────────────────────────────────
+        q = message.lower()
+        if any(w in q for w in ("owe", "balance", "money", "pay", "due")):
+            top = sorted(orders_slim, key=lambda x: x.get("balance", 0), reverse=True)
+            top = [o for o in top if o.get("balance", 0) > 0][:5]
+            reply = f"Outstanding balance: ${balance_due:,.2f} across {len(orders_list)} orders."
+            if top:
+                reply += " Largest balances: " + ", ".join(f"{o['customer']} (${o['balance']:.2f})" for o in top)
+        elif any(w in q for w in ("overdue", "late", "past", "behind")):
+            if overdue:
+                names = ", ".join(o["customer_name"] for o in overdue[:5])
+                reply = f"{len(overdue)} overdue order(s): {names}. Follow up with manufacturers."
+            else:
+                reply = "No overdue orders right now — you're all caught up."
+        elif any(w in q for w in ("arriv", "week", "coming", "transit", "shipping")):
+            transit = [o for o in orders_slim if o.get("status") == "In Transit"]
+            reply = (f"{len(transit)} order(s) currently in transit. "
+                     f"Check expected dates to confirm arrivals this week.")
+        elif any(w in q for w in ("pickup", "ready", "waiting", "call")):
+            if ready:
+                names = ", ".join(o["customer_name"] for o in ready[:5])
+                reply = f"{len(ready)} order(s) ready for pickup: {names}. Call to schedule delivery."
+            else:
+                reply = "No orders waiting for pickup right now."
+        else:
+            reply = (f"I have live data on your {len(orders_list)} orders. "
+                     f"Ask about balances, overdue orders, what's arriving, or specific customers.")
+        return jsonify({"reply": reply, "fallback": True})
+
+
+# ── GREAT BRIDGE FURNITURE — SCAN TICKET ─────────────────────────────────────
+
+@app.route("/api/gb/scan-ticket", methods=["POST"])
+def gb_scan_ticket():
+    """
+    Upload a photo/scan of a handwritten order ticket.
+    Accepts multipart form with 'image' file field.
+    Returns: { fields: { customer_name, phone, items, manufacturer, total_price,
+                          deposit_paid, expected_date, status, notes } }
+    """
+    if "image" not in request.files:
+        return jsonify({"error": "No image file uploaded"}), 400
+
+    img_file = request.files["image"]
+    try:
+        raw      = img_file.read()
+        mime     = img_file.content_type or "image/jpeg"
+        b64_data = _b64_mod.b64encode(raw).decode()
+    except Exception as e:
+        return jsonify({"error": f"Could not read image: {e}"}), 400
+
+    extract_prompt = (
+        "This is a photo or scan of a handwritten furniture store order ticket from Great Bridge Furniture. "
+        "Extract all visible information and return it as a JSON object with ONLY these exact keys: "
+        "customer_name, phone, items, manufacturer, total_price, deposit_paid, expected_date, status, notes. "
+        "For 'items', return a string listing all items visible. "
+        "For 'expected_date', use ISO format YYYY-MM-DD if you can determine the date, otherwise null. "
+        "For any field not visible or unclear, return null. "
+        "Return ONLY valid JSON with no explanation, no markdown fences, just the raw JSON object.\n\n"
+        f"[Image attached as base64 {mime}: {b64_data[:60]}... (truncated for context — use the actual image data to extract fields)]"
+    )
+
+    extracted = {}
+    try:
+        aivm   = get_aivm()
+        result = aivm.run_inference(extract_prompt, timeout_secs=180)
+        # Strip markdown code fences if present
+        cleaned = _re_mod.sub(r"```(?:json)?", "", result).strip().strip("`").strip()
+        # Find the first { ... } block
+        match = _re_mod.search(r"\{.*\}", cleaned, _re_mod.DOTALL)
+        if match:
+            extracted = json.loads(match.group())
+        else:
+            extracted = json.loads(cleaned)
+    except Exception as e:
+        print(f"[gb/scan-ticket] AIVM/parse error: {e}")
+        return jsonify({"error": f"Could not extract data from image: {e}"}), 500
+
+    # Ensure all expected keys exist (fill missing with None)
+    keys = ["customer_name", "phone", "items", "manufacturer",
+            "total_price", "deposit_paid", "expected_date", "status", "notes"]
+    fields = {k: extracted.get(k) for k in keys}
+
+    return jsonify({"fields": fields})
+
+
+# ── GREAT BRIDGE FURNITURE — PROPOSAL ────────────────────────────────────────
+
+@app.route("/api/gb/proposal/<int:order_id>")
+def gb_proposal(order_id):
+    """
+    Generate a printable HTML customer proposal for an order.
+    Returns Content-Type: text/html directly (open in new tab).
+    """
+    try:
+        _init_db()
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT * FROM gb_orders WHERE id = ?", (order_id,)
+            ).fetchone()
+    except Exception as e:
+        return f"<html><body>Database error: {e}</body></html>", 500
+
+    if not row:
+        return "<html><body>Order not found.</body></html>", 404
+
+    order = dict(row)
+    today = time.strftime("%B %d, %Y")
+
+    # Parse items
+    items_raw = order.get("items", "")
+    try:
+        items_list = json.loads(items_raw) if isinstance(items_raw, str) else items_raw
+        if not isinstance(items_list, list):
+            items_list = [str(items_raw)]
+    except Exception:
+        items_list = [str(items_raw)] if items_raw else []
+
+    total    = float(order.get("total_amount") or 0)
+    deposit  = float(order.get("deposit_paid") or 0)
+    balance  = total - deposit
+    exp_date = order.get("expected_date") or "To be confirmed"
+
+    # Try AIVM first
+    aivm_prompt = (
+        "Create a professional, warm customer proposal letter for a furniture store sale. "
+        "Format it as complete HTML (no doctype/html/head/body tags — just the content HTML). "
+        "Include: company header with name, address, phone; customer name; itemized order list; "
+        "total price, deposit paid, balance due; expected delivery date; friendly thank-you message; "
+        "and a print button. Use clean styling with inline CSS — dark on white, professional look. "
+        "Business: Great Bridge Furniture, 1325 S Battlefield Blvd, Chesapeake VA 23322, Phone: 757-482-6622. "
+        f"Order details: Customer: {order.get('customer_name')}, "
+        f"Phone: {order.get('phone') or 'N/A'}, "
+        f"Items: {', '.join(items_list)}, "
+        f"Manufacturer: {order.get('manufacturer') or 'N/A'}, "
+        f"Total: ${total:,.2f}, Deposit Paid: ${deposit:,.2f}, Balance Due: ${balance:,.2f}, "
+        f"Expected Delivery: {exp_date}, "
+        f"Status: {order.get('status')}, "
+        f"Notes: {order.get('notes') or 'None'}. "
+        f"Today's date: {today}."
+    )
+
+    html_body = None
+    try:
+        aivm      = get_aivm()
+        raw       = aivm.run_inference(aivm_prompt, timeout_secs=180)
+        # Strip markdown fences
+        html_body = _re_mod.sub(r"```(?:html)?", "", raw).strip().strip("`").strip()
+    except Exception as e:
+        print(f"[gb/proposal] AIVM error: {e}")
+
+    if not html_body:
+        # ── Fallback: generate directly from data ─────────────────────────
+        items_html = "".join(f"<tr><td style='padding:8px 16px'>{item}</td></tr>" for item in items_list)
+        html_body = f"""
+<div style="font-family:Georgia,serif;max-width:700px;margin:40px auto;padding:40px;border:1px solid #ddd;border-radius:8px">
+  <div style="text-align:center;border-bottom:2px solid #2c3e50;padding-bottom:20px;margin-bottom:28px">
+    <h1 style="margin:0;font-size:28px;color:#2c3e50">Great Bridge Furniture</h1>
+    <p style="margin:6px 0 0;color:#666;font-size:15px">1325 S Battlefield Blvd, Chesapeake VA 23322 &nbsp;|&nbsp; 757-482-6622</p>
+  </div>
+  <p style="font-size:15px;color:#666;margin-bottom:24px">Date: {today}</p>
+  <h2 style="font-size:20px;color:#2c3e50;margin-bottom:6px">Customer Order Proposal</h2>
+  <p style="margin:0 0 4px"><strong>Customer:</strong> {order.get('customer_name') or '—'}</p>
+  <p style="margin:0 0 20px"><strong>Phone:</strong> {order.get('phone') or '—'}</p>
+  <table style="width:100%;border-collapse:collapse;margin-bottom:20px">
+    <thead><tr style="background:#2c3e50;color:#fff"><th style="padding:10px 16px;text-align:left">Items Ordered</th></tr></thead>
+    <tbody style="background:#f9f9f9">{items_html}</tbody>
+  </table>
+  <table style="width:100%;border-collapse:collapse;margin-bottom:28px">
+    <tr><td style="padding:8px;border-bottom:1px solid #eee"><strong>Manufacturer:</strong></td><td style="padding:8px;border-bottom:1px solid #eee">{order.get('manufacturer') or '—'}</td></tr>
+    <tr><td style="padding:8px;border-bottom:1px solid #eee"><strong>Total Price:</strong></td><td style="padding:8px;border-bottom:1px solid #eee;font-weight:bold">${total:,.2f}</td></tr>
+    <tr><td style="padding:8px;border-bottom:1px solid #eee"><strong>Deposit Paid:</strong></td><td style="padding:8px;border-bottom:1px solid #eee;color:#27ae60">${deposit:,.2f}</td></tr>
+    <tr><td style="padding:8px;border-bottom:1px solid #eee"><strong>Balance Due:</strong></td><td style="padding:8px;border-bottom:1px solid #eee;font-weight:bold;color:{'#e74c3c' if balance > 0 else '#27ae60'}">${balance:,.2f}</td></tr>
+    <tr><td style="padding:8px"><strong>Expected Delivery:</strong></td><td style="padding:8px">{exp_date}</td></tr>
+  </table>
+  <p style="background:#eaf4fb;border-left:4px solid #2c3e50;padding:16px;border-radius:4px;font-size:15px;line-height:1.7">
+    Thank you for choosing Great Bridge Furniture! We truly appreciate your business and look forward to delivering beautiful furniture to your home.
+    If you have any questions about your order, please don't hesitate to call us at <strong>757-482-6622</strong>.
+  </p>
+  <div style="text-align:center;margin-top:32px">
+    <button onclick="window.print()" style="background:#2c3e50;color:#fff;border:none;padding:12px 28px;border-radius:6px;font-size:16px;cursor:pointer;font-family:inherit">🖨️ Print Proposal</button>
+  </div>
+</div>
+"""
+
+    full_html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Proposal — {order.get('customer_name') or 'Customer'} | Great Bridge Furniture</title>
+<style>
+  body {{ margin:0; padding:20px; background:#f5f5f5; font-family:Georgia,serif; }}
+  @media print {{
+    body {{ background:#fff; padding:0; }}
+    button {{ display:none !important; }}
+  }}
+</style>
+</head>
+<body>
+{html_body}
+</body>
+</html>"""
+
+    from flask import Response
+    return Response(full_html, content_type="text/html; charset=utf-8")
+
+
 # ── MAIN ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
