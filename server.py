@@ -1651,8 +1651,9 @@ def gb_restructure_sheets():
         return jsonify({"error": "Maximum 10 files at once"}), 400
 
     # ── Step 1: Read all files into a list of dicts ──────────────────────────
-    all_rows    = []
-    all_headers = set()
+    all_rows           = []
+    all_headers_seen   = set()    # for fast duplicate check
+    all_headers_ordered = []      # preserves original column order
     file_summaries = []
 
     for f in files:
@@ -1688,7 +1689,10 @@ def gb_restructure_sheets():
 
             file_summaries.append(f"{fname}: {len(rows)} rows")
             for r in rows:
-                all_headers.update(r.keys())
+                for k in r.keys():
+                    if k not in all_headers_seen:
+                        all_headers_seen.add(k)
+                        all_headers_ordered.append(k)
             all_rows.extend(rows)
 
         except Exception as e:
@@ -1703,7 +1707,7 @@ def gb_restructure_sheets():
 
     if not unified_cols:
         # Ask AIVM to propose unified columns
-        headers_list = sorted(all_headers)
+        headers_list = all_headers_ordered
         prompt = (
             "Great Bridge Furniture has provided spreadsheet data with these column names across all files:\n"
             f"{', '.join(headers_list)}\n\n"
@@ -1717,10 +1721,10 @@ def gb_restructure_sheets():
             aivm_result = aivm.run_inference(prompt, timeout_secs=120)
             clean = _re_mod.sub(r'```(?:json)?\s*|\s*```', '', aivm_result).strip()
             match = _re_mod.search(r'\[.*\]', clean, _re_mod.DOTALL)
-            unified_cols = json.loads(match.group()) if match else list(all_headers)
+            unified_cols = json.loads(match.group()) if match else list(all_headers_ordered)
         except Exception as e:
             print(f"[gb/restructure AIVM col mapping] {e}")
-            unified_cols = sorted(all_headers)
+            unified_cols = list(all_headers_ordered)
 
     # ── Step 3: Map each row to unified columns ───────────────────────────────
     def _best_match(src_col, unified):
