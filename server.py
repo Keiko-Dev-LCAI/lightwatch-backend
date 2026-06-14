@@ -65,7 +65,7 @@ _QB_TOKENS = {}   # { realm_id: {access_token, refresh_token, expires_at} }
 _QB_LOCK   = threading.Lock()
 
 # ── GREAT BRIDGE FURNITURE — SQLite DB ───────────────────────────────────────
-DB_PATH = os.environ.get("DB_PATH", "/tmp/lightview.db")
+DB_PATH = os.environ.get("DB_PATH", "/data/lightview.db")
 
 def _db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
