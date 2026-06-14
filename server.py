@@ -714,6 +714,22 @@ def qb_data():
         return jsonify({"error": str(e)}), 500
 
 
+# ── PIN Authentication ───────────────────────────────────────────────────────
+LIGHTVIEW_ADMIN_PIN = os.environ.get("LIGHTVIEW_PIN", "8300")
+
+@app.route("/api/auth", methods=["POST"])
+def auth_pin():
+    """
+    Body: { pin: str }
+    Validates PIN against LIGHTVIEW_PIN env var (default 8300).
+    Returns { ok: true, role: "admin" } on success.
+    """
+    data = request.get_json(force=True) or {}
+    pin  = str(data.get("pin", "")).strip()
+    if pin == LIGHTVIEW_ADMIN_PIN:
+        return jsonify({"ok": True, "role": "admin"})
+    return jsonify({"ok": False}), 401
+
 # ── Contact / Demo Request ───────────────────────────────────────────────────
 @app.route("/api/contact", methods=["POST"])
 def contact():
