@@ -1063,24 +1063,100 @@ def gb_import_spreadsheet():
                 "source": "AIVM",
                 "headers": headers_found,
             })
-    except json.JSONDecodeError:
-        return jsonify({
-            "orders": [],
-            "rows_scanned": len(raw_rows),
-            "raw_response": (aivm_result or "")[:800],
-            "source": "parse_error",
-            "headers": headers_found,
-            "error": "AIVM returned something that wasn't valid JSON — check raw_response",
-        }), 200
     except Exception as e:
-        print(f"[gb/import AIVM] {e}")
-        return jsonify({
-            "orders": [],
-            "rows_scanned": len(raw_rows),
-            "headers": headers_found,
-            "error": str(e),
-            "source": "aivm_error",
+        print(f"[gb/import AIVM] {e} — using rule-based fallback")
+
+    # ── Rule-based fallback: map columns without AIVM ────────────────────────
+    # Look for column names that match known order fields
+    COL_MAP = {
+        "customer_name":  ["customer", "customer name", "name", "client", "buyer", "bill to", "sold to"],
+        "phone":          ["phone", "telephone", "cell", "mobile", "contact", "phone number"],
+        "items":          ["items", "item", "description", "product", "furniture", "order", "goods", "merchandise"],
+        "manufacturer":   ["manufacturer", "vendor", "supplier", "brand", "maker", "mfg", "source"],
+        "total_amount":   ["total", "total amount", "price", "amount", "sale", "invoice", "cost", "balance"],
+        "deposit_paid":   ["deposit", "deposit paid", "paid", "down payment", "down", "payment"],
+        "expected_date":  ["expected", "expected date", "eta", "due date", "delivery date", "arrival", "ship date"],
+        "status":         ["status", "order status", "stage", "state"],
+        "notes":          ["notes", "note", "comments", "comment", "remarks", "memo", "details"],
+    }
+
+    def _find_col(field, row_keys):
+        """Return the first row key that matches the field's aliases."""
+        aliases = COL_MAP.get(field, [])
+        for key in row_keys:
+            key_lower = key.lower().strip()
+            if key_lower in aliases or any(a in key_lower for a in aliases):
+                return key
+        return None
+
+    STATUS_VALS = {"ordered", "in transit", "received", "ready for pickup", "delivered", "paid"}
+
+    def _normalize_status(val):
+        if not val:
+            return "Ordered"
+        v = val.strip().lower()
+        for s in STATUS_VALS:
+            if s in v:
+                return s.title().replace("For", "for").replace("for P", "for P")
+        return "Ordered"
+
+    keys = list(raw_rows[0].keys()) if raw_rows else []
+    col_lookup = {field: _find_col(field, keys) for field in COL_MAP}
+
+    orders = []
+    for row in raw_rows:
+        def _get(field):
+            col = col_lookup.get(field)
+            return row.get(col, "").strip() if col else ""
+
+        name = _get("customer_name")
+        if not name:
+            continue   # skip rows with no customer name
+
+        # Items: try to split on commas/semicolons
+        items_raw = _get("items")
+        items = [i.strip() for i in _re_mod.split(r'[;,]+', items_raw) if i.strip()] if items_raw else []
+
+        # Parse numeric fields
+        def _num(val):
+            try:
+                return float(_re_mod.sub(r'[^\d.]', '', val))
+            except Exception:
+                return 0.0
+
+        # Parse date
+        date_raw = _get("expected_date")
+        date_out = None
+        if date_raw:
+            for fmt in ('%Y-%m-%d', '%m/%d/%Y', '%m-%d-%Y', '%d/%m/%Y', '%Y/%m/%d'):
+                try:
+                    from datetime import datetime as _dt
+                    date_out = _dt.strptime(date_raw, fmt).strftime('%Y-%m-%d')
+                    break
+                except Exception:
+                    pass
+            if not date_out:
+                date_out = date_raw  # keep as-is
+
+        orders.append({
+            "customer_name":  name,
+            "phone":          _get("phone"),
+            "items":          items or [items_raw] if items_raw else [],
+            "manufacturer":   _get("manufacturer"),
+            "total_amount":   _num(_get("total_amount")),
+            "deposit_paid":   _num(_get("deposit_paid")),
+            "expected_date":  date_out,
+            "status":         _normalize_status(_get("status")),
+            "notes":          _get("notes"),
         })
+
+    return jsonify({
+        "orders":       orders,
+        "rows_scanned": len(raw_rows),
+        "orders_found": len(orders),
+        "source":       "fallback",
+        "headers":      headers_found,
+    })
 
 
 @app.route("/api/gb/attention", methods=["GET"])
