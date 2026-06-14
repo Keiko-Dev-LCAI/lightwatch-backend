@@ -1442,7 +1442,23 @@ def gb_restructure_sheets():
             seen.add(key)
             deduped.append(r)
 
-    # ── Step 4: Write clean .xlsx with openpyxl ───────────────────────────────
+    # ── Step 4a: CSV export (if requested) ───────────────────────────────────
+    export_format = request.form.get('format', 'xlsx').lower().strip()
+    if export_format == 'csv':
+        out_buf = io.StringIO()
+        writer  = _csv_mod.DictWriter(out_buf, fieldnames=unified_cols, extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(deduped)
+        csv_bytes = out_buf.getvalue().encode('utf-8-sig')   # utf-8-sig = BOM for Windows Excel
+        filename  = f"GB_Unified_{time.strftime('%Y%m%d_%H%M')}.csv"
+        return send_file(
+            io.BytesIO(csv_bytes),
+            mimetype='text/csv',
+            as_attachment=True,
+            download_name=filename
+        )
+
+    # ── Step 4b: Write clean .xlsx with openpyxl ─────────────────────────────
     wb_out = openpyxl.Workbook()
     ws_out = wb_out.active
     ws_out.title = "Unified Data"
