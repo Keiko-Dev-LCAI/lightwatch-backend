@@ -1069,15 +1069,22 @@ def gb_import_spreadsheet():
     # ── Rule-based fallback: map columns without AIVM ────────────────────────
     # Look for column names that match known order fields
     COL_MAP = {
-        "customer_name":  ["customer", "customer name", "name", "client", "buyer", "bill to", "sold to", "tagged", "tag", "tagged as", "customer tag", "warehouse tag"],
+        "customer_name":  ["customer", "customer name", "name", "client", "buyer", "bill to", "sold to",
+                           "tagged", "tag", "tagged as", "customer tag", "warehouse tag"],
         "phone":          ["phone", "telephone", "cell", "mobile", "contact", "phone number"],
-        "items":          ["items", "item", "description", "product", "furniture", "order", "goods", "merchandise"],
+        "items":          ["items", "item", "description", "product", "furniture", "order", "goods",
+                           "merchandise", "desc", "part description", "partnumber", "part number",
+                           "part #", "part#", "sku", "model", "finish", "finish/fabric", "fabric"],
         "manufacturer":   ["manufacturer", "vendor", "supplier", "brand", "maker", "mfg", "source"],
-        "total_amount":   ["total", "total amount", "price", "amount", "sale", "invoice", "cost", "balance"],
+        "total_amount":   ["total", "total amount", "price", "amount", "sale", "invoice", "cost",
+                           "balance", "unit cost", "retail", "retail price"],
         "deposit_paid":   ["deposit", "deposit paid", "paid", "down payment", "down", "payment"],
-        "expected_date":  ["expected", "expected date", "eta", "due date", "delivery date", "arrival", "ship date"],
-        "status":         ["status", "order status", "stage", "state"],
-        "notes":          ["notes", "note", "comments", "comment", "remarks", "memo", "details"],
+        "expected_date":  ["expected", "expected date", "eta", "due date", "delivery date", "arrival",
+                           "ship date", "date out", "out date", "date sold", "ship", "delivery"],
+        "status":         ["status", "order status", "stage", "state", "location", "loc"],
+        "notes":          ["notes", "note", "comments", "comment", "remarks", "memo", "details",
+                           "po#", "po #", "purchase order", "po number", "verified", "intl",
+                           "initials", "approved by"],
     }
 
     def _find_col(field, row_keys):
