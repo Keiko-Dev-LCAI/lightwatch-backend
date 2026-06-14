@@ -1069,7 +1069,7 @@ def gb_import_spreadsheet():
     # ── Rule-based fallback: map columns without AIVM ────────────────────────
     # Look for column names that match known order fields
     COL_MAP = {
-        "customer_name":  ["customer", "customer name", "name", "client", "buyer", "bill to", "sold to"],
+        "customer_name":  ["customer", "customer name", "name", "client", "buyer", "bill to", "sold to", "tagged", "tag", "tagged as", "customer tag", "warehouse tag"],
         "phone":          ["phone", "telephone", "cell", "mobile", "contact", "phone number"],
         "items":          ["items", "item", "description", "product", "furniture", "order", "goods", "merchandise"],
         "manufacturer":   ["manufacturer", "vendor", "supplier", "brand", "maker", "mfg", "source"],
