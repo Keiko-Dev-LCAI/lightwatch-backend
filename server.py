@@ -1161,12 +1161,26 @@ def gb_import_spreadsheet():
                 try: return _dt.strptime(raw, fmt).strftime('%Y-%m-%d')
                 except: pass
             return raw
+        # Pre-collect any free-form "notes_append:FieldName" → spreadsheet-column mappings
+        _notes_append_map = {k[len('notes_append:'):]: v
+                             for k, v in explicit_map.items()
+                             if k.startswith('notes_append:')}
+
         orders = []
         inv_rows_em = []
         for row in raw_rows:
             def _gx(field):
                 col = explicit_map.get(field)
                 return row.get(col, "").strip() if col else ""
+            # Build extra notes from free-form columns: "Label1: Val1 | Label2: Val2"
+            _extra_parts = [f"{lbl}: {row.get(col, '').strip()}"
+                            for lbl, col in _notes_append_map.items()
+                            if row.get(col, '').strip()]
+            _notes_extra = " | ".join(_extra_parts)
+            def _merge_notes(base):
+                if _notes_extra:
+                    return (base + "\n" + _notes_extra) if base else _notes_extra
+                return base
             name = _gx("customer_name")
             if name:
                 # Order row — has a customer/TAG
@@ -1180,7 +1194,7 @@ def gb_import_spreadsheet():
                     "deposit_paid": _num(_gx("deposit_paid")),
                     "expected_date": _parse_date_em(_gx("expected_date")),
                     "status": _normalize_status(_gx("status")),
-                    "notes": _gx("notes"),
+                    "notes": _merge_notes(_gx("notes")),
                 })
             else:
                 # Inventory row — blank TAG means warehouse stock
@@ -1194,7 +1208,7 @@ def gb_import_spreadsheet():
                     "cost_price": _num(_gx("cost_price")) or None,
                     "retail_price": _num(_gx("total_amount")) or None,
                     "date_in": _parse_date_em(_gx("date_in") or _gx("expected_date")),
-                    "notes": _gx("notes"), "status": "Available",
+                    "notes": _merge_notes(_gx("notes")), "status": "Available",
                 })
         inv_saved_em = 0
         if inv_rows_em:
