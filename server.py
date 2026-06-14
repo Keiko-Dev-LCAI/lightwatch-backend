@@ -20,7 +20,7 @@ Env vars required (set in Railway):
 import os, json, time, threading, secrets as _secrets_mod
 import base64 as _b64_mod
 import sqlite3, io, csv as _csv_mod, re as _re_mod
-from flask import Flask, request, jsonify, session, redirect
+from flask import Flask, request, jsonify, session, redirect, send_file
 from flask_cors import CORS
 import requests as req
 
@@ -88,6 +88,16 @@ def _init_db():
                 notes          TEXT,
                 created_at     TEXT    DEFAULT (datetime('now')),
                 updated_at     TEXT    DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS gb_docs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id    INTEGER NOT NULL,
+                filename    TEXT    NOT NULL,
+                filetype    TEXT,
+                filedata    BLOB    NOT NULL,
+                uploaded_at TEXT    DEFAULT (datetime('now'))
             )
         """)
         conn.commit()
@@ -1041,6 +1051,423 @@ def gb_attention():
         "stats": {"total": len(orders), "overdue": len(overdue),
                   "ready": len(ready), "balance_due": round(balance_due, 2)},
     })
+
+
+# ── GREAT BRIDGE FURNITURE — DOCUMENT ATTACHMENTS ────────────────────────────
+
+@app.route("/api/gb/orders/<int:order_id>/docs", methods=["POST"])
+def gb_upload_doc(order_id):
+    """Upload a file (PDF/image) and attach it to an order. Stores as BLOB."""
+    if 'file' not in request.files:
+        return jsonify({"error": "No file in request"}), 400
+    f = request.files['file']
+    if not f or not f.filename:
+        return jsonify({"error": "Empty file"}), 400
+
+    filename = f.filename
+    # Safety: strip any path components
+    filename = filename.replace('\\', '/').split('/')[-1][:255]
+    filetype = f.content_type or 'application/octet-stream'
+    # Restrict to safe file types
+    allowed_ext = {'.pdf', '.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic',
+                   '.doc', '.docx', '.xls', '.xlsx', '.csv', '.txt'}
+    ext = '.' + filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+    if ext not in allowed_ext:
+        return jsonify({"error": f"File type not allowed: {ext}"}), 400
+
+    try:
+        filedata = f.read()
+        if len(filedata) > 20 * 1024 * 1024:   # 20 MB cap
+            return jsonify({"error": "File too large (20 MB max)"}), 400
+        _init_db()
+        with _db() as conn:
+            cur = conn.execute(
+                "INSERT INTO gb_docs (order_id, filename, filetype, filedata) VALUES (?,?,?,?)",
+                (order_id, filename, filetype, filedata)
+            )
+            conn.commit()
+            doc_id = cur.lastrowid
+        return jsonify({"ok": True, "doc_id": doc_id, "filename": filename})
+    except Exception as e:
+        print(f"[gb/docs POST order={order_id}] {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/gb/orders/<int:order_id>/docs", methods=["GET"])
+def gb_list_docs(order_id):
+    """List all docs attached to an order (metadata only — no file bytes)."""
+    try:
+        _init_db()
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT id, filename, filetype, uploaded_at FROM gb_docs WHERE order_id = ? ORDER BY uploaded_at DESC",
+                (order_id,)
+            ).fetchall()
+        return jsonify({"docs": [dict(r) for r in rows]})
+    except Exception as e:
+        print(f"[gb/docs GET order={order_id}] {e}")
+        return jsonify({"error": str(e), "docs": []}), 500
+
+
+@app.route("/api/gb/docs/<int:doc_id>", methods=["GET"])
+def gb_serve_doc(doc_id):
+    """Serve the actual file bytes for a document."""
+    try:
+        _init_db()
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT filename, filetype, filedata FROM gb_docs WHERE id = ?", (doc_id,)
+            ).fetchone()
+        if not row:
+            return jsonify({"error": "Document not found"}), 404
+        filename, filetype, filedata = row["filename"], row["filetype"], row["filedata"]
+        return send_file(
+            io.BytesIO(filedata),
+            mimetype=filetype or 'application/octet-stream',
+            as_attachment=True,
+            download_name=filename
+        )
+    except Exception as e:
+        print(f"[gb/docs/{doc_id} GET] {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# ── GREAT BRIDGE FURNITURE — SPREADSHEET ANALYSIS + RESTRUCTURE ──────────────
+
+@app.route("/api/gb/analyze-sheets", methods=["POST"])
+def gb_analyze_sheets():
+    """
+    Upload 1-10 Excel files. AIVM reads all of them, understands column
+    meanings across files, identifies overlaps and patterns, and returns
+    a plain-English analysis + a proposed unified column mapping.
+
+    Returns: { analysis: str, column_mapping: {...}, files_read: int, source: str }
+    """
+    files = request.files.getlist('files')
+    if not files or len(files) == 0:
+        return jsonify({"error": "No files uploaded"}), 400
+    if len(files) > 10:
+        return jsonify({"error": "Maximum 10 files at once"}), 400
+
+    all_file_summaries = []
+
+    for f in files:
+        fname = (f.filename or "").strip()
+        ext   = ('.' + fname.rsplit('.', 1)[-1].lower()) if '.' in fname else ''
+        if ext not in {'.xlsx', '.xls', '.csv'}:
+            continue
+
+        try:
+            content = f.read()
+            rows    = []
+
+            if ext == '.csv':
+                text   = content.decode('utf-8', errors='replace')
+                reader = _csv_mod.DictReader(io.StringIO(text))
+                for i, row in enumerate(reader):
+                    rows.append({k: str(v) for k, v in row.items()})
+                    if i >= 100:
+                        break
+                headers = list(reader.fieldnames or [])
+            else:
+                import openpyxl
+                wb      = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+                ws      = wb.active
+                headers = []
+                for i, row in enumerate(ws.iter_rows(values_only=True)):
+                    if i == 0:
+                        headers = [str(h).strip() if h is not None else f"col{j}" for j, h in enumerate(row)]
+                    elif not all(v is None for v in row):
+                        rows.append({
+                            headers[j]: str(v).strip() if v is not None else ""
+                            for j, v in enumerate(row) if j < len(headers)
+                        })
+                    if i >= 100:
+                        break
+                wb.close()
+
+            sample_rows = rows[:15]
+            rows_text   = "\n".join(
+                " | ".join(f"{k}: {v}" for k, v in r.items() if v and v.lower() not in ('none', ''))
+                for r in sample_rows
+            )
+            all_file_summaries.append(
+                f"FILE: {fname}\nColumns: {', '.join(headers)}\nSample rows ({len(rows)} total rows):\n{rows_text}"
+            )
+
+        except Exception as e:
+            all_file_summaries.append(f"FILE: {fname} — ERROR reading: {e}")
+
+    if not all_file_summaries:
+        return jsonify({"error": "Could not read any uploaded files"}), 400
+
+    combined_text = "\n\n---\n\n".join(all_file_summaries)
+
+    prompt = (
+        "You are analyzing spreadsheets uploaded by Great Bridge Furniture, a furniture store in Chesapeake Virginia.\n"
+        "They have uploaded multiple Excel/CSV files that may contain overlapping or related customer order data.\n\n"
+        f"{combined_text}\n\n"
+        "Please analyze these spreadsheets and provide:\n\n"
+        "1. WHAT EACH FILE CONTAINS — a plain-English description of what data is in each file\n"
+        "2. OVERLAPPING COLUMNS — identify columns that appear to contain the same kind of data across files, "
+        "even if named differently (e.g. 'Cust Name' vs 'Customer' vs 'Buyer Name' all mean the same thing). "
+        "List them clearly.\n"
+        "3. DUPLICATE DATA — if the same orders or customers appear in multiple files, note that.\n"
+        "4. DATA QUALITY ISSUES — missing values, inconsistent formats, empty columns, etc.\n"
+        "5. RECOMMENDED UNIFIED COLUMNS — propose a clean set of column names for a merged spreadsheet "
+        "that captures all the useful data from all files.\n\n"
+        "After your analysis, output a JSON block at the end in this exact format:\n"
+        "```json\n"
+        '{"unified_columns": ["Col1", "Col2", ...], '
+        '"file_mappings": {"filename.xlsx": {"their_col": "unified_col", ...}}}\n'
+        "```\n"
+        "Be specific and practical — David at Great Bridge Furniture needs to understand this."
+    )
+
+    try:
+        aivm        = get_aivm()
+        aivm_result = aivm.run_inference(prompt, timeout_secs=300)
+
+        # Try to parse the JSON block at the end
+        column_mapping = {}
+        json_match = _re_mod.search(r'```json\s*(.*?)\s*```', aivm_result, _re_mod.DOTALL)
+        if json_match:
+            try:
+                column_mapping = json.loads(json_match.group(1))
+            except Exception:
+                pass
+
+        # Clean the analysis text (remove the JSON block for display)
+        analysis_text = _re_mod.sub(r'```json\s*.*?\s*```', '', aivm_result, flags=_re_mod.DOTALL).strip()
+
+        return jsonify({
+            "analysis":       analysis_text,
+            "column_mapping": column_mapping,
+            "files_read":     len(all_file_summaries),
+            "source":         "AIVM",
+        })
+
+    except Exception as e:
+        print(f"[gb/analyze-sheets] AIVM error: {e}")
+        # Fallback: just summarize what we found
+        summary_lines = [f"Read {len(all_file_summaries)} file(s)."]
+        for s in all_file_summaries:
+            first_line = s.split('\n')[0]
+            summary_lines.append(f"• {first_line}")
+        return jsonify({
+            "analysis":       "\n".join(summary_lines) + f"\n\nAIVM unavailable: {e}",
+            "column_mapping": {},
+            "files_read":     len(all_file_summaries),
+            "source":         "fallback",
+        })
+
+
+@app.route("/api/gb/restructure-sheets", methods=["POST"])
+def gb_restructure_sheets():
+    """
+    Upload 1-10 Excel files (same as analyze-sheets).
+    Optionally include a JSON 'mapping' field with unified column definitions.
+    AIVM merges all the data into one clean .xlsx file which is returned as download.
+
+    Returns: .xlsx file download
+    """
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    files   = request.files.getlist('files')
+    mapping_json = request.form.get('mapping', '{}')
+    try:
+        mapping = json.loads(mapping_json)
+    except Exception:
+        mapping = {}
+
+    if not files or len(files) == 0:
+        return jsonify({"error": "No files uploaded"}), 400
+    if len(files) > 10:
+        return jsonify({"error": "Maximum 10 files at once"}), 400
+
+    # ── Step 1: Read all files into a list of dicts ──────────────────────────
+    all_rows    = []
+    all_headers = set()
+    file_summaries = []
+
+    for f in files:
+        fname = (f.filename or "").strip()
+        ext   = ('.' + fname.rsplit('.', 1)[-1].lower()) if '.' in fname else ''
+        if ext not in {'.xlsx', '.xls', '.csv'}:
+            continue
+        try:
+            content = f.read()
+            rows = []
+            if ext == '.csv':
+                text   = content.decode('utf-8', errors='replace')
+                reader = _csv_mod.DictReader(io.StringIO(text))
+                for row in reader:
+                    rows.append({k.strip(): str(v).strip() for k, v in row.items()})
+                    if len(rows) >= 5000:
+                        break
+            else:
+                wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+                ws = wb.active
+                headers = []
+                for i, row in enumerate(ws.iter_rows(values_only=True)):
+                    if i == 0:
+                        headers = [str(h).strip() if h is not None else f"col{j}" for j, h in enumerate(row)]
+                    elif not all(v is None for v in row):
+                        rows.append({
+                            headers[j]: str(v).strip() if v is not None else ""
+                            for j, v in enumerate(row) if j < len(headers)
+                        })
+                    if i >= 5000:
+                        break
+                wb.close()
+
+            file_summaries.append(f"{fname}: {len(rows)} rows")
+            for r in rows:
+                all_headers.update(r.keys())
+            all_rows.extend(rows)
+
+        except Exception as e:
+            file_summaries.append(f"{fname}: ERROR — {e}")
+
+    if not all_rows:
+        return jsonify({"error": "No readable data found in uploaded files"}), 400
+
+    # ── Step 2: Build AIVM prompt to get clean column mapping ────────────────
+    file_col_map = mapping.get("file_mappings", {})
+    unified_cols = mapping.get("unified_columns", [])
+
+    if not unified_cols:
+        # Ask AIVM to propose unified columns
+        headers_list = sorted(all_headers)
+        prompt = (
+            "Great Bridge Furniture has provided spreadsheet data with these column names across all files:\n"
+            f"{', '.join(headers_list)}\n\n"
+            "Many of these columns contain the same type of data with different names. "
+            "Please propose a clean, unified set of column headers for a merged spreadsheet. "
+            "Output ONLY a JSON array of the unified column names, nothing else.\n"
+            'Example: ["Customer Name", "Phone", "Items Ordered", "Manufacturer", "Total", "Deposit", "Expected Date", "Status", "Notes"]'
+        )
+        try:
+            aivm        = get_aivm()
+            aivm_result = aivm.run_inference(prompt, timeout_secs=120)
+            clean = _re_mod.sub(r'```(?:json)?\s*|\s*```', '', aivm_result).strip()
+            match = _re_mod.search(r'\[.*\]', clean, _re_mod.DOTALL)
+            unified_cols = json.loads(match.group()) if match else list(all_headers)
+        except Exception as e:
+            print(f"[gb/restructure AIVM col mapping] {e}")
+            unified_cols = sorted(all_headers)
+
+    # ── Step 3: Map each row to unified columns ───────────────────────────────
+    def _best_match(src_col, unified):
+        """Simple fuzzy match — normalize both sides and find best overlap."""
+        src_lower = src_col.lower().replace('_', ' ').strip()
+        for u in unified:
+            u_lower = u.lower().replace('_', ' ').strip()
+            if src_lower == u_lower:
+                return u
+        # Word overlap
+        src_words = set(src_lower.split())
+        best_col, best_score = None, 0
+        for u in unified:
+            u_words = set(u.lower().replace('_', ' ').strip().split())
+            score   = len(src_words & u_words)
+            if score > best_score:
+                best_col, best_score = u, score
+        return best_col if best_score > 0 else None
+
+    cleaned_rows = []
+    for row in all_rows:
+        new_row = {c: "" for c in unified_cols}
+        for src_col, val in row.items():
+            if not val or val.lower() in ('none', 'null', ''):
+                continue
+            # Check explicit mapping first
+            target = None
+            for fname_key, col_map in file_col_map.items():
+                if src_col in col_map:
+                    target = col_map[src_col]
+                    break
+            if not target:
+                target = _best_match(src_col, unified_cols)
+            if target and target in new_row:
+                if not new_row[target]:     # don't overwrite existing value
+                    new_row[target] = val
+        # Only include rows that have at least one non-empty value
+        if any(v.strip() for v in new_row.values()):
+            cleaned_rows.append(new_row)
+
+    # Remove exact duplicate rows
+    seen     = set()
+    deduped  = []
+    for r in cleaned_rows:
+        key = tuple(r.get(c, '') for c in unified_cols)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(r)
+
+    # ── Step 4: Write clean .xlsx with openpyxl ───────────────────────────────
+    wb_out = openpyxl.Workbook()
+    ws_out = wb_out.active
+    ws_out.title = "Unified Data"
+
+    # Header row — navy blue background, white bold text
+    header_fill = PatternFill("solid", fgColor="1B3A5C")
+    header_font = Font(bold=True, color="FFFFFF", size=12)
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    for col_idx, col_name in enumerate(unified_cols, start=1):
+        cell = ws_out.cell(row=1, column=col_idx, value=col_name)
+        cell.fill   = header_fill
+        cell.font   = header_font
+        cell.alignment = header_align
+
+    # Freeze header row
+    ws_out.freeze_panes = "A2"
+
+    # Data rows
+    row_fill_alt = PatternFill("solid", fgColor="F5F8FC")   # light blue-grey alternating rows
+    for row_idx, row_data in enumerate(deduped, start=2):
+        for col_idx, col_name in enumerate(unified_cols, start=1):
+            cell = ws_out.cell(row=row_idx, column=col_idx, value=row_data.get(col_name, ""))
+            if row_idx % 2 == 0:
+                cell.fill = row_fill_alt
+
+    # Auto-fit column widths (approximate)
+    for col_idx, col_name in enumerate(unified_cols, start=1):
+        max_len = len(col_name)
+        for row_data in deduped[:200]:     # sample first 200 rows
+            v = str(row_data.get(col_name, ""))
+            if len(v) > max_len:
+                max_len = len(v)
+        ws_out.column_dimensions[
+            openpyxl.utils.get_column_letter(col_idx)
+        ].width = min(max_len + 4, 50)
+
+    ws_out.row_dimensions[1].height = 28
+
+    # Summary tab
+    ws_sum = wb_out.create_sheet("Import Summary")
+    ws_sum.append(["Source Files"])
+    for s in file_summaries:
+        ws_sum.append([s])
+    ws_sum.append([])
+    ws_sum.append([f"Total rows after dedup: {len(deduped)}"])
+    ws_sum.append([f"Unified columns: {len(unified_cols)}"])
+    ws_sum.append([f"Generated: {time.strftime('%Y-%m-%d %H:%M')}"])
+
+    # Write to BytesIO and return
+    out_buf = io.BytesIO()
+    wb_out.save(out_buf)
+    out_buf.seek(0)
+
+    filename = f"GB_Unified_{time.strftime('%Y%m%d_%H%M')}.xlsx"
+    return send_file(
+        out_buf,
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        as_attachment=True,
+        download_name=filename
+    )
 
 
 # ── MAIN ─────────────────────────────────────────────────────────────────────
