@@ -1203,26 +1203,46 @@ def gb_analyze_sheets():
 
     combined_text = "\n\n---\n\n".join(all_file_summaries)
 
-    prompt = (
-        "You are analyzing spreadsheets uploaded by Great Bridge Furniture, a furniture store in Chesapeake Virginia.\n"
-        "They have uploaded multiple Excel/CSV files that may contain overlapping or related customer order data.\n\n"
-        f"{combined_text}\n\n"
-        "Please analyze these spreadsheets and provide:\n\n"
-        "1. WHAT EACH FILE CONTAINS — a plain-English description of what data is in each file\n"
-        "2. OVERLAPPING COLUMNS — identify columns that appear to contain the same kind of data across files, "
-        "even if named differently (e.g. 'Cust Name' vs 'Customer' vs 'Buyer Name' all mean the same thing). "
-        "List them clearly.\n"
-        "3. DUPLICATE DATA — if the same orders or customers appear in multiple files, note that.\n"
-        "4. DATA QUALITY ISSUES — missing values, inconsistent formats, empty columns, etc.\n"
-        "5. RECOMMENDED UNIFIED COLUMNS — propose a clean set of column names for a merged spreadsheet "
-        "that captures all the useful data from all files.\n\n"
-        "After your analysis, output a JSON block at the end in this exact format:\n"
-        "```json\n"
-        '{"unified_columns": ["Col1", "Col2", ...], '
-        '"file_mappings": {"filename.xlsx": {"their_col": "unified_col", ...}}}\n'
-        "```\n"
-        "Be specific and practical — David at Great Bridge Furniture needs to understand this."
-    )
+    if len(all_file_summaries) == 1:
+        fname = all_file_summaries[0].get("filename", "the file")
+        prompt = (
+            "You are analyzing a spreadsheet uploaded by Great Bridge Furniture, a furniture store in Chesapeake Virginia.\n"
+            f"They have uploaded one file: {fname}\n\n"
+            f"{combined_text}\n\n"
+            "Please analyze this spreadsheet and provide:\n\n"
+            "1. WHAT THIS FILE CONTAINS — a plain-English description of what data is in this file\n"
+            "2. COLUMN SUMMARY — describe what each column contains and what it is used for\n"
+            "3. DATA QUALITY ISSUES — missing values, inconsistent formats, empty columns, etc.\n"
+            "4. KEY INSIGHTS — notable patterns, totals, or anything David at Great Bridge Furniture should know\n"
+            "5. CLEAN COLUMN NAMES — propose clean professional column names if any improvements are possible\n\n"
+            "After your analysis, output a JSON block at the end in this exact format:\n"
+            "```json\n"
+            '{"unified_columns": ["Col1", "Col2", ...], '
+            '"file_mappings": {"' + fname + '": {"their_col": "unified_col", ...}}}\n'
+            "```\n"
+            "Be specific and practical — David at Great Bridge Furniture needs to understand this."
+        )
+    else:
+        prompt = (
+            "You are analyzing spreadsheets uploaded by Great Bridge Furniture, a furniture store in Chesapeake Virginia.\n"
+            "They have uploaded multiple Excel/CSV files that may contain overlapping or related customer order data.\n\n"
+            f"{combined_text}\n\n"
+            "Please analyze these spreadsheets and provide:\n\n"
+            "1. WHAT EACH FILE CONTAINS — a plain-English description of what data is in each file\n"
+            "2. OVERLAPPING COLUMNS — identify columns that appear to contain the same kind of data across files, "
+            "even if named differently (e.g. 'Cust Name' vs 'Customer' vs 'Buyer Name' all mean the same thing). "
+            "List them clearly.\n"
+            "3. DUPLICATE DATA — if the same orders or customers appear in multiple files, note that.\n"
+            "4. DATA QUALITY ISSUES — missing values, inconsistent formats, empty columns, etc.\n"
+            "5. RECOMMENDED UNIFIED COLUMNS — propose a clean set of column names for a merged spreadsheet "
+            "that captures all the useful data from all files.\n\n"
+            "After your analysis, output a JSON block at the end in this exact format:\n"
+            "```json\n"
+            '{"unified_columns": ["Col1", "Col2", ...], '
+            '"file_mappings": {"filename.xlsx": {"their_col": "unified_col", ...}}}\n'
+            "```\n"
+            "Be specific and practical — David at Great Bridge Furniture needs to understand this."
+        )
 
     try:
         aivm        = get_aivm()
