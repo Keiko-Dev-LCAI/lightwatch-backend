@@ -1001,7 +1001,7 @@ def gb_import_spreadsheet():
             reader = _csv_mod.DictReader(io.StringIO(text))
             for row in reader:
                 raw_rows.append({k: str(v) for k, v in row.items() if v is not None})
-                if len(raw_rows) >= 300:
+                if len(raw_rows) >= 10000:
                     break
         elif fname.endswith(('.xlsx', '.xls')):
             import openpyxl
@@ -1016,7 +1016,7 @@ def gb_import_spreadsheet():
                         headers[j]: str(v).strip() if v is not None else ""
                         for j, v in enumerate(row) if j < len(headers)
                     })
-                if i >= 300:
+                if i >= 10000:
                     break
             wb.close()
         else:
