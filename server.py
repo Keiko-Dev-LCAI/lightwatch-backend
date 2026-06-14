@@ -985,13 +985,62 @@ def gb_save_import():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/gb/import", methods=["POST"])
-def gb_import_spreadsheet():
-    """Upload CSV or Excel → AIVM reads it → returns JSON orders array for preview."""
+@app.route("/api/gb/import-preview", methods=["POST"])
+def gb_import_preview():
+    """Read column headers + sample rows from an uploaded spreadsheet — no AIVM needed."""
     if 'file' not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
     f     = request.files['file']
     fname = (f.filename or "").lower()
+    try:
+        content = f.read()
+        headers = []
+        samples = []
+        if fname.endswith('.csv'):
+            text   = content.decode('utf-8', errors='replace')
+            reader = _csv_mod.DictReader(io.StringIO(text))
+            headers = list(reader.fieldnames or [])
+            for i, row in enumerate(reader):
+                samples.append({k: str(v).strip() for k, v in row.items()})
+                if i >= 4:
+                    break
+        elif fname.endswith(('.xlsx', '.xls')):
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
+            ws = wb.active
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                if i == 0:
+                    headers = [str(h).strip() if h is not None else f"col{j}" for j, h in enumerate(row)]
+                else:
+                    samples.append({headers[j]: str(v).strip() if v is not None else "" for j, v in enumerate(row) if j < len(headers)})
+                    if i >= 5:
+                        break
+            wb.close()
+        else:
+            return jsonify({"error": "Please upload a .csv or .xlsx file"}), 400
+        return jsonify({"headers": headers, "samples": samples, "filename": f.filename})
+    except Exception as e:
+        return jsonify({"error": f"Could not read file: {e}"}), 400
+
+
+@app.route("/api/gb/import", methods=["POST"])
+def gb_import_spreadsheet():
+    """Upload CSV or Excel → returns JSON orders array for preview.
+    Accepts optional 'column_map' JSON: {"their_col": "our_field", ...}
+    Our fields: customer_name, phone, items, manufacturer, total_amount,
+                deposit_paid, expected_date, status, notes
+    """
+    if 'file' not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    f     = request.files['file']
+    fname = (f.filename or "").lower()
+
+    # Optional explicit column map from the UI
+    explicit_map = {}
+    try:
+        explicit_map = json.loads(request.form.get('column_map', '{}'))
+    except Exception:
+        pass
 
     raw_rows = []
     try:
@@ -1005,18 +1054,24 @@ def gb_import_spreadsheet():
                     break
         elif fname.endswith(('.xlsx', '.xls')):
             import openpyxl
-            wb      = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
-            ws      = wb.active
+            # Do NOT use read_only=True — some Excel files have a broken internal
+            # dimension tag that causes openpyxl to stop early in read_only mode.
+            wb      = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
             headers = None
-            for i, row in enumerate(ws.iter_rows(values_only=True)):
-                if i == 0:
-                    headers = [str(h).strip() if h is not None else f"col{j}" for j, h in enumerate(row)]
-                elif not all(v is None for v in row):
-                    raw_rows.append({
-                        headers[j]: str(v).strip() if v is not None else ""
-                        for j, v in enumerate(row) if j < len(headers)
-                    })
-                if i >= 10000:
+            # Iterate ALL worksheets so multi-sheet workbooks are fully read
+            for ws in wb.worksheets:
+                for i, row in enumerate(ws.iter_rows(values_only=True)):
+                    if headers is None and i == 0:
+                        headers = [str(h).strip() if h is not None else f"col{j}"
+                                   for j, h in enumerate(row)]
+                    elif headers is not None and not all(v is None for v in row):
+                        raw_rows.append({
+                            headers[j]: str(v).strip() if v is not None else ""
+                            for j, v in enumerate(row) if j < len(headers)
+                        })
+                    if len(raw_rows) >= 10000:
+                        break
+                if len(raw_rows) >= 10000:
                     break
             wb.close()
         else:
@@ -1067,6 +1122,52 @@ def gb_import_spreadsheet():
         print(f"[gb/import AIVM] {e} — using rule-based fallback")
 
     # ── Rule-based fallback: map columns without AIVM ────────────────────────
+    # If explicit_map provided by UI, use it directly
+    if explicit_map:
+        OUR_FIELDS = ["customer_name","phone","items","manufacturer",
+                      "total_amount","deposit_paid","expected_date","status","notes"]
+        STATUS_VALS = {"ordered","in transit","received","ready for pickup","delivered","paid"}
+        def _normalize_status(val):
+            if not val: return "Ordered"
+            v = val.strip().lower()
+            for s in STATUS_VALS:
+                if s in v: return s.title()
+            return "Ordered"
+        def _num(val):
+            try: return float(_re_mod.sub(r'[^\d.]', '', val))
+            except: return 0.0
+        orders = []
+        for row in raw_rows:
+            def _gx(field):
+                col = explicit_map.get(field)
+                return row.get(col, "").strip() if col else ""
+            name = _gx("customer_name")
+            if not name: continue
+            items_raw = _gx("items")
+            items = [i.strip() for i in _re_mod.split(r'[;,]+', items_raw) if i.strip()] if items_raw else []
+            date_raw = _gx("expected_date")
+            date_out = None
+            if date_raw:
+                for fmt in ('%Y-%m-%d','%m/%d/%Y','%m-%d-%Y','%d/%m/%Y','%Y/%m/%d'):
+                    try:
+                        from datetime import datetime as _dt
+                        date_out = _dt.strptime(date_raw, fmt).strftime('%Y-%m-%d'); break
+                    except: pass
+                if not date_out: date_out = date_raw
+            orders.append({
+                "customer_name": name, "phone": _gx("phone"),
+                "items": items or ([items_raw] if items_raw else []),
+                "manufacturer": _gx("manufacturer"),
+                "total_amount": _num(_gx("total_amount")),
+                "deposit_paid": _num(_gx("deposit_paid")),
+                "expected_date": date_out,
+                "status": _normalize_status(_gx("status")),
+                "notes": _gx("notes"),
+            })
+        return jsonify({"orders": orders, "rows_scanned": len(raw_rows),
+                        "orders_found": len(orders), "source": "explicit_map",
+                        "headers": headers_found})
+
     # Look for column names that match known order fields
     COL_MAP = {
         "customer_name":  ["customer", "customer name", "name", "client", "buyer", "bill to", "sold to",
@@ -1598,7 +1699,7 @@ def gb_analyze_sheets():
                 headers = list(reader.fieldnames or [])
             else:
                 import openpyxl
-                wb      = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+                wb      = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
                 ws      = wb.active
                 headers = []
                 for i, row in enumerate(ws.iter_rows(values_only=True)):
