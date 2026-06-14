@@ -155,6 +155,26 @@ def _init_db():
                 created_at TEXT    DEFAULT (datetime('now'))
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS gb_inventory (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                sku                TEXT,
+                description        TEXT,
+                manufacturer       TEXT,
+                finish_fabric      TEXT,
+                warehouse_location TEXT,
+                cost_price         REAL,
+                retail_price       REAL,
+                status             TEXT DEFAULT 'Available',
+                customer_name      TEXT,
+                order_id           INTEGER,
+                date_in            TEXT,
+                date_out           TEXT,
+                delivery_type      TEXT,
+                notes              TEXT,
+                created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         conn.commit()
 
 try:
@@ -1124,8 +1144,6 @@ def gb_import_spreadsheet():
     # ── Rule-based fallback: map columns without AIVM ────────────────────────
     # If explicit_map provided by UI, use it directly
     if explicit_map:
-        OUR_FIELDS = ["customer_name","phone","items","manufacturer",
-                      "total_amount","deposit_paid","expected_date","status","notes"]
         STATUS_VALS = {"ordered","in transit","received","ready for pickup","delivered","paid"}
         def _normalize_status(val):
             if not val: return "Ordered"
@@ -1136,56 +1154,96 @@ def gb_import_spreadsheet():
         def _num(val):
             try: return float(_re_mod.sub(r'[^\d.]', '', val))
             except: return 0.0
+        def _parse_date_em(raw):
+            if not raw: return None
+            from datetime import datetime as _dt
+            for fmt in ('%Y-%m-%d','%m/%d/%Y','%m-%d-%Y','%d/%m/%Y','%Y/%m/%d'):
+                try: return _dt.strptime(raw, fmt).strftime('%Y-%m-%d')
+                except: pass
+            return raw
         orders = []
+        inv_rows_em = []
         for row in raw_rows:
             def _gx(field):
                 col = explicit_map.get(field)
                 return row.get(col, "").strip() if col else ""
             name = _gx("customer_name")
-            if not name: continue
-            items_raw = _gx("items")
-            items = [i.strip() for i in _re_mod.split(r'[;,]+', items_raw) if i.strip()] if items_raw else []
-            date_raw = _gx("expected_date")
-            date_out = None
-            if date_raw:
-                for fmt in ('%Y-%m-%d','%m/%d/%Y','%m-%d-%Y','%d/%m/%Y','%Y/%m/%d'):
-                    try:
-                        from datetime import datetime as _dt
-                        date_out = _dt.strptime(date_raw, fmt).strftime('%Y-%m-%d'); break
-                    except: pass
-                if not date_out: date_out = date_raw
-            orders.append({
-                "customer_name": name, "phone": _gx("phone"),
-                "items": items or ([items_raw] if items_raw else []),
-                "manufacturer": _gx("manufacturer"),
-                "total_amount": _num(_gx("total_amount")),
-                "deposit_paid": _num(_gx("deposit_paid")),
-                "expected_date": date_out,
-                "status": _normalize_status(_gx("status")),
-                "notes": _gx("notes"),
-            })
+            if name:
+                # Order row — has a customer/TAG
+                items_raw = _gx("items")
+                items = [i.strip() for i in _re_mod.split(r'[;,]+', items_raw) if i.strip()] if items_raw else []
+                orders.append({
+                    "customer_name": name, "phone": _gx("phone"),
+                    "items": items or ([items_raw] if items_raw else []),
+                    "manufacturer": _gx("manufacturer"),
+                    "total_amount": _num(_gx("total_amount")),
+                    "deposit_paid": _num(_gx("deposit_paid")),
+                    "expected_date": _parse_date_em(_gx("expected_date")),
+                    "status": _normalize_status(_gx("status")),
+                    "notes": _gx("notes"),
+                })
+            else:
+                # Inventory row — blank TAG means warehouse stock
+                desc = _gx("items") or _gx("notes")
+                if not desc: continue
+                inv_rows_em.append({
+                    "sku": _gx("sku"), "description": desc,
+                    "manufacturer": _gx("manufacturer"),
+                    "finish_fabric": _gx("finish_fabric"),
+                    "warehouse_location": _gx("warehouse_location"),
+                    "cost_price": _num(_gx("cost_price")) or None,
+                    "retail_price": _num(_gx("total_amount")) or None,
+                    "date_in": _parse_date_em(_gx("date_in") or _gx("expected_date")),
+                    "notes": _gx("notes"), "status": "Available",
+                })
+        inv_saved_em = 0
+        if inv_rows_em:
+            try:
+                _init_db()
+                with _db() as conn:
+                    for inv in inv_rows_em:
+                        conn.execute(
+                            "INSERT INTO gb_inventory (sku,description,manufacturer,finish_fabric,"
+                            "warehouse_location,cost_price,retail_price,status,date_in,notes) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                            (inv.get('sku',''), inv.get('description',''), inv.get('manufacturer',''),
+                             inv.get('finish_fabric',''), inv.get('warehouse_location',''),
+                             inv.get('cost_price'), inv.get('retail_price'),
+                             inv.get('status','Available'), inv.get('date_in',''), inv.get('notes','')))
+                    conn.commit()
+                inv_saved_em = len(inv_rows_em)
+            except Exception as _ie:
+                print(f"[gb/import inventory] {_ie}")
         return jsonify({"orders": orders, "rows_scanned": len(raw_rows),
-                        "orders_found": len(orders), "source": "explicit_map",
-                        "headers": headers_found})
+                        "orders_added": len(orders), "inventory_added": inv_saved_em,
+                        "source": "explicit_map", "headers": headers_found})
 
-    # Look for column names that match known order fields
+    # Look for column names that match known order and inventory fields
     COL_MAP = {
-        "customer_name":  ["customer", "customer name", "name", "client", "buyer", "bill to", "sold to",
-                           "tagged", "tag", "tagged as", "customer tag", "warehouse tag"],
-        "phone":          ["phone", "telephone", "cell", "mobile", "contact", "phone number"],
-        "items":          ["items", "item", "description", "product", "furniture", "order", "goods",
-                           "merchandise", "desc", "part description", "partnumber", "part number",
-                           "part #", "part#", "sku", "model", "finish", "finish/fabric", "fabric"],
-        "manufacturer":   ["manufacturer", "vendor", "supplier", "brand", "maker", "mfg", "source"],
-        "total_amount":   ["total", "total amount", "price", "amount", "sale", "invoice", "cost",
-                           "balance", "unit cost", "retail", "retail price"],
-        "deposit_paid":   ["deposit", "deposit paid", "paid", "down payment", "down", "payment"],
-        "expected_date":  ["expected", "expected date", "eta", "due date", "delivery date", "arrival",
-                           "ship date", "date out", "out date", "date sold", "ship", "delivery"],
-        "status":         ["status", "order status", "stage", "state", "location", "loc"],
-        "notes":          ["notes", "note", "comments", "comment", "remarks", "memo", "details",
-                           "po#", "po #", "purchase order", "po number", "verified", "intl",
-                           "initials", "approved by"],
+        "customer_name":     ["customer", "customer name", "name", "client", "buyer", "bill to", "sold to",
+                              "tagged", "tag", "tagged as", "customer tag", "warehouse tag"],
+        "phone":             ["phone", "telephone", "cell", "mobile", "contact", "phone number"],
+        "items":             ["items", "item", "description", "product", "furniture", "order", "goods",
+                              "merchandise", "desc", "part description", "model"],
+        "manufacturer":      ["manufacturer", "vendor", "supplier", "brand", "maker", "mfg", "source"],
+        "total_amount":      ["total", "total amount", "price", "amount", "sale", "invoice",
+                              "balance", "retail", "retail price"],
+        "deposit_paid":      ["deposit", "deposit paid", "paid", "down payment", "down", "payment"],
+        "expected_date":     ["expected", "expected date", "eta", "due date", "delivery date", "arrival",
+                              "ship date", "date out", "out date", "date sold", "ship", "delivery"],
+        "status":            ["status", "order status", "stage", "state"],
+        "notes":             ["notes", "note", "comments", "comment", "remarks", "memo", "details",
+                              "po#", "po #", "purchase order", "po number", "verified", "intl",
+                              "initials", "approved by"],
+        # Inventory-specific fields
+        "warehouse_location": ["location", "loc", "warehouse", "warehouse location", "warehouse loc",
+                               "wh location", "bin", "shelf", "whloc"],
+        "sku":               ["sku", "part#", "part number", "part #", "part no", "item#",
+                              "item number", "style#", "style number", "partnumber"],
+        "finish_fabric":     ["finish", "fabric", "finish/fabric", "color", "colour", "material"],
+        "cost_price":        ["cost", "cost price", "unit cost", "our cost", "dealer cost", "net", "net price"],
+        "date_in":           ["date in", "date arrived", "arrived", "received", "receipt date",
+                              "in date", "date received"],
     }
 
     def _find_col(field, row_keys):
@@ -1208,63 +1266,184 @@ def gb_import_spreadsheet():
                 return s.title().replace("For", "for").replace("for P", "for P")
         return "Ordered"
 
+    def _num(val):
+        try:
+            return float(_re_mod.sub(r'[^\d.]', '', val))
+        except Exception:
+            return 0.0
+
+    def _parse_date(raw):
+        if not raw: return None
+        from datetime import datetime as _dt
+        for fmt in ('%Y-%m-%d', '%m/%d/%Y', '%m-%d-%Y', '%d/%m/%Y', '%Y/%m/%d'):
+            try:
+                return _dt.strptime(raw, fmt).strftime('%Y-%m-%d')
+            except Exception:
+                pass
+        return raw
+
     keys = list(raw_rows[0].keys()) if raw_rows else []
     col_lookup = {field: _find_col(field, keys) for field in COL_MAP}
 
     orders = []
+    inventory_items = []
     for row in raw_rows:
         def _get(field):
             col = col_lookup.get(field)
             return row.get(col, "").strip() if col else ""
 
         name = _get("customer_name")
-        if not name:
-            continue   # skip rows with no customer name
+        if name:
+            # Order row — has a customer/TAG
+            items_raw = _get("items")
+            items = [i.strip() for i in _re_mod.split(r'[;,]+', items_raw) if i.strip()] if items_raw else []
+            orders.append({
+                "customer_name":  name,
+                "phone":          _get("phone"),
+                "items":          items or [items_raw] if items_raw else [],
+                "manufacturer":   _get("manufacturer"),
+                "total_amount":   _num(_get("total_amount")),
+                "deposit_paid":   _num(_get("deposit_paid")),
+                "expected_date":  _parse_date(_get("expected_date")),
+                "status":         _normalize_status(_get("status")),
+                "notes":          _get("notes"),
+            })
+        else:
+            # Inventory row — blank TAG means warehouse stock, not a customer order
+            desc = _get("items") or _get("notes")
+            if not desc: continue
+            inventory_items.append({
+                "sku":               _get("sku"),
+                "description":       desc,
+                "manufacturer":      _get("manufacturer"),
+                "finish_fabric":     _get("finish_fabric"),
+                "warehouse_location": _get("warehouse_location"),
+                "cost_price":        _num(_get("cost_price")) or None,
+                "retail_price":      _num(_get("total_amount")) or None,
+                "date_in":           _parse_date(_get("date_in") or _get("expected_date")),
+                "notes":             _get("notes"),
+                "status":            "Available",
+            })
 
-        # Items: try to split on commas/semicolons
-        items_raw = _get("items")
-        items = [i.strip() for i in _re_mod.split(r'[;,]+', items_raw) if i.strip()] if items_raw else []
-
-        # Parse numeric fields
-        def _num(val):
-            try:
-                return float(_re_mod.sub(r'[^\d.]', '', val))
-            except Exception:
-                return 0.0
-
-        # Parse date
-        date_raw = _get("expected_date")
-        date_out = None
-        if date_raw:
-            for fmt in ('%Y-%m-%d', '%m/%d/%Y', '%m-%d-%Y', '%d/%m/%Y', '%Y/%m/%d'):
-                try:
-                    from datetime import datetime as _dt
-                    date_out = _dt.strptime(date_raw, fmt).strftime('%Y-%m-%d')
-                    break
-                except Exception:
-                    pass
-            if not date_out:
-                date_out = date_raw  # keep as-is
-
-        orders.append({
-            "customer_name":  name,
-            "phone":          _get("phone"),
-            "items":          items or [items_raw] if items_raw else [],
-            "manufacturer":   _get("manufacturer"),
-            "total_amount":   _num(_get("total_amount")),
-            "deposit_paid":   _num(_get("deposit_paid")),
-            "expected_date":  date_out,
-            "status":         _normalize_status(_get("status")),
-            "notes":          _get("notes"),
-        })
+    # Save inventory items immediately to db
+    inv_saved = 0
+    if inventory_items:
+        try:
+            _init_db()
+            with _db() as conn:
+                for inv in inventory_items:
+                    conn.execute(
+                        "INSERT INTO gb_inventory (sku,description,manufacturer,finish_fabric,"
+                        "warehouse_location,cost_price,retail_price,status,date_in,notes) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (inv.get('sku',''), inv.get('description',''), inv.get('manufacturer',''),
+                         inv.get('finish_fabric',''), inv.get('warehouse_location',''),
+                         inv.get('cost_price'), inv.get('retail_price'),
+                         inv.get('status','Available'), inv.get('date_in',''), inv.get('notes','')))
+                conn.commit()
+            inv_saved = len(inventory_items)
+        except Exception as _ie:
+            print(f"[gb/import inventory] {_ie}")
 
     return jsonify({
-        "orders":       orders,
-        "rows_scanned": len(raw_rows),
-        "orders_found": len(orders),
-        "source":       "fallback",
-        "headers":      headers_found,
+        "orders":          orders,
+        "rows_scanned":    len(raw_rows),
+        "orders_added":    len(orders),
+        "inventory_added": inv_saved,
+        "source":          "fallback",
+        "headers":         headers_found,
     })
+
+
+@app.route("/api/gb/inventory", methods=["GET"])
+def gb_inventory_list():
+    """List inventory items with optional filters: status, manufacturer, q (search)."""
+    status_f = request.args.get('status', '')
+    mfr_f    = request.args.get('manufacturer', '')
+    q        = request.args.get('q', '')
+    try:
+        _init_db()
+        with _db() as conn:
+            sql = "SELECT * FROM gb_inventory WHERE 1=1"
+            params = []
+            if status_f:
+                sql += " AND status=?"; params.append(status_f)
+            if mfr_f:
+                sql += " AND manufacturer=?"; params.append(mfr_f)
+            if q:
+                sql += (" AND (description LIKE ? OR manufacturer LIKE ? OR sku LIKE ?"
+                        " OR warehouse_location LIKE ? OR customer_name LIKE ?)")
+                params += [f'%{q}%'] * 5
+            sql += " ORDER BY created_at DESC"
+            rows = conn.execute(sql, params).fetchall()
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/gb/inventory", methods=["POST"])
+def gb_inventory_add():
+    """Add a single inventory item."""
+    d = request.get_json() or {}
+    try:
+        _init_db()
+        with _db() as conn:
+            conn.execute(
+                "INSERT INTO gb_inventory (sku,description,manufacturer,finish_fabric,"
+                "warehouse_location,cost_price,retail_price,status,customer_name,order_id,"
+                "date_in,date_out,delivery_type,notes) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (d.get('sku',''), d.get('description',''), d.get('manufacturer',''),
+                 d.get('finish_fabric',''), d.get('warehouse_location',''),
+                 d.get('cost_price') or None, d.get('retail_price') or None,
+                 d.get('status','Available'), d.get('customer_name',''),
+                 d.get('order_id') or None, d.get('date_in',''), d.get('date_out',''),
+                 d.get('delivery_type',''), d.get('notes','')))
+            conn.commit()
+        _log_activity(d.get('user_name',''), 'addInventory',
+                      d.get('description','item'), f"SKU:{d.get('sku','')}")
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route("/api/gb/inventory/<int:item_id>", methods=["PUT"])
+def gb_inventory_update(item_id):
+    """Update an inventory item."""
+    d = request.get_json() or {}
+    fields = ['sku','description','manufacturer','finish_fabric','warehouse_location',
+              'cost_price','retail_price','status','customer_name','order_id',
+              'date_in','date_out','delivery_type','notes']
+    try:
+        _init_db()
+        with _db() as conn:
+            sets = ', '.join(f"{f}=?" for f in fields)
+            vals = [d.get(f) for f in fields] + [item_id]
+            conn.execute(f"UPDATE gb_inventory SET {sets} WHERE id=?", vals)
+            conn.commit()
+        _log_activity(d.get('user_name',''), 'updateInventory',
+                      d.get('description','item'), f"id:{item_id}")
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route("/api/gb/inventory/<int:item_id>", methods=["DELETE"])
+def gb_inventory_delete(item_id):
+    """Delete an inventory item."""
+    user_name = request.args.get('user_name', '')
+    try:
+        _init_db()
+        with _db() as conn:
+            row = conn.execute("SELECT description FROM gb_inventory WHERE id=?",
+                               (item_id,)).fetchone()
+            desc = row['description'] if row else str(item_id)
+            conn.execute("DELETE FROM gb_inventory WHERE id=?", (item_id,))
+            conn.commit()
+        _log_activity(user_name, 'deleteInventory', desc, f"id:{item_id}")
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route("/api/gb/attention", methods=["GET"])
