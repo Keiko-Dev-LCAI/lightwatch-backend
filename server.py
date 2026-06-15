@@ -74,8 +74,41 @@ def _db():
 
 def _init_db():
     with _db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS gb_orders (
+        c = conn
+        # ── Multi-tenant: companies ───────────────────────────────────────────
+        c.execute("""CREATE TABLE IF NOT EXISTS companies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            slug TEXT UNIQUE NOT NULL,
+            pin TEXT DEFAULT '8300',
+            business_type TEXT DEFAULT '',
+            address TEXT DEFAULT '',
+            phone TEXT DEFAULT '',
+            logo_emoji TEXT DEFAULT '🏢',
+            created_at TEXT DEFAULT (datetime('now'))
+        )""")
+        c.execute("""INSERT OR IGNORE INTO companies (id,name,slug,pin,business_type,address,phone,logo_emoji)
+        VALUES (1,'Great Bridge Furniture','gbf','8300','furniture_retail',
+        '1325 S Battlefield Blvd, Chesapeake VA 23322','757-482-6622','🛋️')""")
+
+        # ── Features per company ──────────────────────────────────────────────
+        c.execute("""CREATE TABLE IF NOT EXISTS company_features (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL,
+            feature_key TEXT NOT NULL,
+            enabled INTEGER DEFAULT 1,
+            display_order INTEGER DEFAULT 99,
+            UNIQUE(company_id, feature_key)
+        )""")
+        _features = ['orders','customers','manufacturers','inventory','purchase_orders',
+                     'email_po','calendar','documents','reports','aivm_assistant',
+                     'activity_log','scan_ticket','proposals','spreadsheet_import','quickbooks']
+        for _i, _fk in enumerate(_features, 1):
+            c.execute("INSERT OR IGNORE INTO company_features (company_id,feature_key,display_order) VALUES (1,?,?)", (_fk, _i))
+
+        # ── Core tables (generic names) ───────────────────────────────────────
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
                 customer_name  TEXT,
                 phone          TEXT,
@@ -90,8 +123,8 @@ def _init_db():
                 updated_at     TEXT    DEFAULT (datetime('now'))
             )
         """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS gb_docs (
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS docs (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 order_id    INTEGER NOT NULL,
                 filename    TEXT    NOT NULL,
@@ -103,15 +136,15 @@ def _init_db():
         # Migrate: add columns to existing orders table
         for _col, _typ in [("delivery_date", "TEXT"), ("arrival_date", "TEXT"), ("ticket_doc_id", "INTEGER")]:
             try:
-                conn.execute(f"ALTER TABLE gb_orders ADD COLUMN {_col} {_typ}")
+                c.execute(f"ALTER TABLE orders ADD COLUMN {_col} {_typ}")
             except Exception:
                 pass  # column already exists
-        # Migrate: add is_ticket flag to gb_docs
+        # Migrate: add is_ticket flag to docs
         try:
-            conn.execute("ALTER TABLE gb_docs ADD COLUMN is_ticket INTEGER DEFAULT 0")
+            c.execute("ALTER TABLE docs ADD COLUMN is_ticket INTEGER DEFAULT 0")
         except Exception:
             pass
-        conn.execute("""
+        c.execute("""
             CREATE TABLE IF NOT EXISTS gb_blocked_days (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 date       TEXT    NOT NULL UNIQUE,
@@ -120,8 +153,8 @@ def _init_db():
                 created_at TEXT    DEFAULT (datetime('now'))
             )
         """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS gb_deliveries (
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS deliveries (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 date        TEXT    NOT NULL,
                 time        TEXT    DEFAULT '',
@@ -136,7 +169,7 @@ def _init_db():
                 updated_at  TEXT    DEFAULT (datetime('now'))
             )
         """)
-        conn.execute("""
+        c.execute("""
             CREATE TABLE IF NOT EXISTS biz_profile (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
                 company        TEXT    NOT NULL UNIQUE,
@@ -150,8 +183,8 @@ def _init_db():
                 updated_at     TEXT    DEFAULT (datetime('now'))
             )
         """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS gb_activity_log (
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS activity_log (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_name  TEXT    NOT NULL DEFAULT 'Unknown',
                 action     TEXT    NOT NULL DEFAULT '',
@@ -160,8 +193,8 @@ def _init_db():
                 created_at TEXT    DEFAULT (datetime('now'))
             )
         """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS gb_inventory (
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS inventory (
                 id                 INTEGER PRIMARY KEY AUTOINCREMENT,
                 sku                TEXT,
                 description        TEXT,
@@ -180,8 +213,8 @@ def _init_db():
                 created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS gb_manufacturers (
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS manufacturers (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
                 name           TEXT NOT NULL,
                 contact_person TEXT DEFAULT '',
@@ -193,16 +226,36 @@ def _init_db():
                 created_at     TEXT DEFAULT (datetime('now'))
             )
         """)
-        # Migrate gb_orders: add manufacturer_id FK column
+        # Migrate orders: add manufacturer_id FK column
         try:
-            conn.execute("ALTER TABLE gb_orders ADD COLUMN manufacturer_id INTEGER")
+            c.execute("ALTER TABLE orders ADD COLUMN manufacturer_id INTEGER")
         except Exception:
             pass
-        # Migrate gb_orders: add po_sent_at column
+        # Migrate orders: add po_sent_at column
         try:
-            conn.execute("ALTER TABLE gb_orders ADD COLUMN po_sent_at TEXT")
+            c.execute("ALTER TABLE orders ADD COLUMN po_sent_at TEXT")
         except Exception:
             pass
+
+        # ── Session 107: rename legacy gb_ tables → generic names ─────────────
+        for _sql in [
+            "ALTER TABLE gb_orders RENAME TO orders",
+            "ALTER TABLE gb_manufacturers RENAME TO manufacturers",
+            "ALTER TABLE gb_docs RENAME TO docs",
+            "ALTER TABLE gb_inventory RENAME TO inventory",
+            "ALTER TABLE gb_deliveries RENAME TO deliveries",
+            "ALTER TABLE gb_activity_log RENAME TO activity_log",
+        ]:
+            try: c.execute(_sql)
+            except: pass
+
+        # Add company_id to each table (default 1 = GBF, preserves all existing data)
+        for _tbl in ['orders','manufacturers','docs','inventory','deliveries','activity_log']:
+            try: c.execute(f"ALTER TABLE {_tbl} ADD COLUMN company_id INTEGER DEFAULT 1")
+            except: pass
+        try: c.execute("ALTER TABLE biz_profile ADD COLUMN company_id INTEGER DEFAULT 1")
+        except: pass
+
         conn.commit()
 
 try:
@@ -213,11 +266,11 @@ except Exception as _e:
 
 
 def _log_activity(user: str, action: str, target: str = "", details: str = ""):
-    """Append one row to gb_activity_log (fire-and-forget, never raises)."""
+    """Append one row to activity_log (fire-and-forget, never raises)."""
     try:
         with _db() as conn:
             conn.execute(
-                "INSERT INTO gb_activity_log (user_name, action, target, details) VALUES (?,?,?,?)",
+                "INSERT INTO activity_log (user_name, action, target, details) VALUES (?,?,?,?)",
                 (str(user or "Unknown")[:100], str(action)[:200],
                  str(target)[:200], str(details)[:500])
             )
@@ -974,20 +1027,37 @@ def qb_data():
 
 
 # ── PIN Authentication ───────────────────────────────────────────────────────
-LIGHTVIEW_ADMIN_PIN = os.environ.get("LIGHTVIEW_PIN", "8300")
 
 @app.route("/api/auth", methods=["POST"])
 def auth_pin():
     """
     Body: { pin: str }
-    Validates PIN against LIGHTVIEW_PIN env var (default 8300).
-    Returns { ok: true, role: "admin" } on success.
+    Looks up company by PIN in the companies table.
+    Returns { ok: true, company: {id, name, slug, emoji, type} } on success.
+    Falls back to env-var PIN for legacy support.
     """
     data = request.get_json(force=True) or {}
     pin  = str(data.get("pin", "")).strip()
-    if pin == LIGHTVIEW_ADMIN_PIN:
-        return jsonify({"ok": True, "role": "admin"})
-    return jsonify({"ok": False}), 401
+    try:
+        with _db() as conn:
+            company = conn.execute(
+                "SELECT id,name,slug,logo_emoji,business_type FROM companies WHERE pin=?", (pin,)
+            ).fetchone()
+        if company:
+            return jsonify({"ok": True, "success": True, "company": {
+                "id": company[0], "name": company[1], "slug": company[2],
+                "emoji": company[3], "type": company[4]
+            }})
+    except Exception as _ae:
+        print(f"[auth] DB lookup error: {_ae}")
+    # Legacy fallback: check env var PIN
+    legacy_pin = os.environ.get("LIGHTVIEW_PIN", "8300")
+    if pin == legacy_pin:
+        return jsonify({"ok": True, "success": True, "company": {
+            "id": 1, "name": "Great Bridge Furniture", "slug": "gbf",
+            "emoji": "🛋️", "type": "furniture_retail"
+        }})
+    return jsonify({"ok": False, "success": False}), 401
 
 # ── Contact / Demo Request ───────────────────────────────────────────────────
 @app.route("/api/contact", methods=["POST"])
@@ -1004,6 +1074,141 @@ def contact():
     return jsonify({"ok": True})
 
 
+# ── MULTI-TENANT: COMPANY & FEATURE ENDPOINTS ────────────────────────────────
+
+@app.route('/api/companies', methods=['GET'])
+def list_companies():
+    with _db() as conn:
+        rows = conn.execute("SELECT id,name,slug,logo_emoji FROM companies ORDER BY id").fetchall()
+    return jsonify(companies=[{'id':r[0],'name':r[1],'slug':r[2],'emoji':r[3]} for r in rows])
+
+
+@app.route('/api/companies', methods=['POST'])
+def create_company():
+    d = request.json or {}
+    with _db() as conn:
+        cur = conn.execute(
+            "INSERT INTO companies (name,slug,pin,business_type,address,phone,logo_emoji) VALUES (?,?,?,?,?,?,?)",
+            (d['name'],d['slug'],d['pin'],d.get('business_type',''),d.get('address',''),d.get('phone',''),d.get('logo_emoji','🏢'))
+        )
+        cid = cur.lastrowid
+    return jsonify(ok=True, company_id=cid)
+
+
+@app.route('/api/companies/<int:cid>/features', methods=['GET'])
+def get_features(cid):
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT feature_key,enabled,display_order FROM company_features WHERE company_id=? ORDER BY display_order",
+            (cid,)
+        ).fetchall()
+    return jsonify(features=[{'key':r[0],'enabled':bool(r[1]),'order':r[2]} for r in rows])
+
+
+@app.route('/api/companies/<int:cid>/features', methods=['PUT'])
+def update_features(cid):
+    data = request.json or []
+    with _db() as conn:
+        for f in data:
+            conn.execute(
+                "INSERT INTO company_features (company_id,feature_key,enabled,display_order) VALUES (?,?,?,?) "
+                "ON CONFLICT(company_id,feature_key) DO UPDATE SET enabled=excluded.enabled,display_order=excluded.display_order",
+                (cid, f['key'], 1 if f['enabled'] else 0, f.get('order',99))
+            )
+    return jsonify(ok=True)
+
+
+# ── AI SETUP WIZARD ───────────────────────────────────────────────────────────
+
+FEATURE_CATALOG = {
+    'orders': 'Order Management — create and track customer orders',
+    'customers': 'Customer Profiles — search customer history and balances',
+    'manufacturers': 'Manufacturer Contacts — supplier/vendor directory',
+    'inventory': 'Inventory Management — track items, SKUs, stock levels',
+    'purchase_orders': 'Purchase Order Generation — print professional POs',
+    'email_po': 'Email PO to Manufacturer — send POs via email',
+    'calendar': 'Delivery Calendar — schedule and print delivery/pickup events',
+    'documents': 'Documents Hub — organize files in virtual folders',
+    'reports': 'Business Reports — sales, deliveries, balances, arrivals',
+    'aivm_assistant': 'AI Assistant — ask questions about your business in plain English',
+    'activity_log': 'Activity Log — who did what and when',
+    'scan_ticket': 'Scan Ticket — photo a paper ticket, AI fills in the order form',
+    'proposals': 'Proposals — AI generates a professional proposal letter per order',
+    'spreadsheet_import': 'Spreadsheet Import — import orders/inventory from Excel or CSV',
+    'quickbooks': 'QuickBooks — connect and view financial data from QuickBooks',
+}
+
+
+@app.route('/api/companies/<int:cid>/setup-wizard', methods=['POST'])
+def setup_wizard(cid):
+    messages = (request.json or {}).get('messages', [])
+    feature_list_str = '\n'.join(f'- {k}: {v}' for k,v in FEATURE_CATALOG.items())
+    system = f"""You are LightView's friendly setup assistant. Help the business owner configure their dashboard by asking simple questions about their business.
+
+Available features:
+{feature_list_str}
+
+Ask 3-5 short, plain-English questions. Once you understand their needs, recommend which features to enable and confirm with them. When they confirm, output exactly this on its own line:
+FEATURES_JSON:{{"orders":true,"customers":true,...}}  (include ALL feature keys, true or false)
+
+Keep responses short and warm. No jargon."""
+
+    aivm_obj = None
+    try:
+        aivm_obj = get_aivm()
+    except Exception:
+        pass
+
+    reply = None
+    if aivm_obj:
+        try:
+            # Try OpenAI-compatible endpoint if available
+            aivm_url = getattr(aivm_obj, '_gateway', None) or AIVM_GATEWAY
+            payload = {
+                "model": "llama3-8b",
+                "messages": [{"role":"system","content":system}] + messages,
+                "stream": False
+            }
+            r = req.post(f"{aivm_url}/v1/chat/completions",
+                headers={"Authorization": f"Bearer {os.environ.get('LIGHTCHAIN_PRIVATE_KEY','')}"},
+                json=payload, timeout=30)
+            if r.status_code == 200:
+                reply = r.json()['choices'][0]['message']['content']
+        except Exception as _we:
+            print(f"[setup-wizard] AIVM error: {_we}")
+
+    if not reply:
+        count = len([m for m in messages if m.get('role') == 'user'])
+        if count == 0:
+            reply = "Hi! I'm your LightView setup assistant 👋 What kind of business are you setting up LightView for?"
+        elif count == 1:
+            reply = "Got it! Do you track customer orders or sales? And do you work with suppliers or manufacturers you order products from?"
+        elif count == 2:
+            reply = "Do you manage deliveries or appointments on a calendar? And do you have team members you'd like to track activity for?"
+        else:
+            reply = 'Great — I have everything I need! Here\'s what I\'ll set up for you:\n\nFEATURES_JSON:{"orders":true,"customers":true,"manufacturers":true,"inventory":true,"purchase_orders":true,"email_po":true,"calendar":true,"documents":true,"reports":true,"aivm_assistant":true,"activity_log":true,"scan_ticket":true,"proposals":true,"spreadsheet_import":true,"quickbooks":false}'
+
+    features_configured = None
+    if 'FEATURES_JSON:' in reply:
+        try:
+            import re as _re_wiz
+            _m = _re_wiz.search(r'FEATURES_JSON:(\{[^}]+\})', reply, _re_wiz.DOTALL)
+            if _m:
+                features_configured = json.loads(_m.group(1))
+                with _db() as conn:
+                    for key, enabled in features_configured.items():
+                        conn.execute(
+                            "INSERT INTO company_features (company_id,feature_key,enabled,display_order) VALUES (?,?,?,?) "
+                            "ON CONFLICT(company_id,feature_key) DO UPDATE SET enabled=excluded.enabled",
+                            (cid, key, 1 if enabled else 0, list(FEATURE_CATALOG.keys()).index(key)+1)
+                        )
+                reply = _re_wiz.sub(r'FEATURES_JSON:\{[^}]+\}', '', reply).strip()
+        except Exception as _pe:
+            print(f"[setup-wizard] parse error: {_pe}")
+
+    return jsonify(reply=reply, features_configured=features_configured)
+
+
 # ── GREAT BRIDGE FURNITURE — ORDER ENDPOINTS ─────────────────────────────────
 
 @app.route("/api/gb/orders", methods=["GET"])
@@ -1013,7 +1218,7 @@ def gb_get_orders():
         _init_db()
         with _db() as conn:
             rows = conn.execute(
-                "SELECT * FROM gb_orders ORDER BY "
+                "SELECT * FROM orders ORDER BY "
                 "CASE status "
                 "  WHEN 'Ready for Pickup' THEN 1 "
                 "  WHEN 'Ordered'          THEN 2 "
@@ -1041,7 +1246,7 @@ def gb_create_order():
         customer  = str(data.get("customer_name") or "Unknown")[:200]
         with _db() as conn:
             cur = conn.execute(
-                "INSERT INTO gb_orders "
+                "INSERT INTO orders "
                 "(customer_name, phone, items, manufacturer, total_amount, deposit_paid, expected_date, delivery_date, status, notes) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (customer,
@@ -1089,9 +1294,9 @@ def gb_update_order(order_id):
         vals.append(order_id)
         # Fetch customer name for the log
         with _db() as conn:
-            row = conn.execute("SELECT customer_name FROM gb_orders WHERE id=?", (order_id,)).fetchone()
+            row = conn.execute("SELECT customer_name FROM orders WHERE id=?", (order_id,)).fetchone()
             customer = row["customer_name"] if row else "?"
-            conn.execute(f"UPDATE gb_orders SET {', '.join(fields)} WHERE id = ?", vals)
+            conn.execute(f"UPDATE orders SET {', '.join(fields)} WHERE id = ?", vals)
             conn.commit()
         # Log a meaningful description of what changed
         if "status" in data:
@@ -1117,13 +1322,13 @@ def gb_delete_order(order_id):
         _init_db()
         with _db() as conn:
             row = conn.execute(
-                "SELECT customer_name FROM gb_orders WHERE id=?", (order_id,)
+                "SELECT customer_name FROM orders WHERE id=?", (order_id,)
             ).fetchone()
             if not row:
                 return jsonify({"error": "Order not found"}), 404
             customer = row["customer_name"]
-            conn.execute("DELETE FROM gb_docs WHERE order_id=?", (order_id,))
-            conn.execute("DELETE FROM gb_orders WHERE id=?", (order_id,))
+            conn.execute("DELETE FROM docs WHERE order_id=?", (order_id,))
+            conn.execute("DELETE FROM orders WHERE id=?", (order_id,))
             conn.commit()
         _log_activity(user, "Deleted order", f"#{order_id}",
                       f"Customer: {customer}")
@@ -1153,7 +1358,7 @@ def gb_save_import():
                 except Exception:
                     total = deposit = 0
                 conn.execute(
-                    "INSERT INTO gb_orders "
+                    "INSERT INTO orders "
                     "(customer_name, phone, items, manufacturer, total_amount, deposit_paid, expected_date, status, notes) "
                     "VALUES (?,?,?,?,?,?,?,?,?)",
                     (str(o.get("customer_name") or "Unknown")[:200],
@@ -1387,7 +1592,7 @@ def gb_import_spreadsheet():
                 with _db() as conn:
                     for inv in inv_rows_em:
                         conn.execute(
-                            "INSERT INTO gb_inventory (sku,description,manufacturer,finish_fabric,"
+                            "INSERT INTO inventory (sku,description,manufacturer,finish_fabric,"
                             "warehouse_location,cost_price,retail_price,status,date_in,notes) "
                             "VALUES (?,?,?,?,?,?,?,?,?,?)",
                             (inv.get('sku',''), inv.get('description',''), inv.get('manufacturer',''),
@@ -1517,7 +1722,7 @@ def gb_import_spreadsheet():
             with _db() as conn:
                 for inv in inventory_items:
                     conn.execute(
-                        "INSERT INTO gb_inventory (sku,description,manufacturer,finish_fabric,"
+                        "INSERT INTO inventory (sku,description,manufacturer,finish_fabric,"
                         "warehouse_location,cost_price,retail_price,status,date_in,notes) "
                         "VALUES (?,?,?,?,?,?,?,?,?,?)",
                         (inv.get('sku',''), inv.get('description',''), inv.get('manufacturer',''),
@@ -1540,7 +1745,7 @@ def gb_import_spreadsheet():
 
 
 @app.route("/api/gb/inventory", methods=["GET"])
-def gb_inventory_list():
+def inventory_list():
     """List inventory items with optional filters: status, manufacturer, q (search)."""
     status_f = request.args.get('status', '')
     mfr_f    = request.args.get('manufacturer', '')
@@ -1548,7 +1753,7 @@ def gb_inventory_list():
     try:
         _init_db()
         with _db() as conn:
-            sql = "SELECT * FROM gb_inventory WHERE 1=1"
+            sql = "SELECT * FROM inventory WHERE 1=1"
             params = []
             if status_f:
                 sql += " AND status=?"; params.append(status_f)
@@ -1566,14 +1771,14 @@ def gb_inventory_list():
 
 
 @app.route("/api/gb/inventory", methods=["POST"])
-def gb_inventory_add():
+def inventory_add():
     """Add a single inventory item."""
     d = request.get_json() or {}
     try:
         _init_db()
         with _db() as conn:
             conn.execute(
-                "INSERT INTO gb_inventory (sku,description,manufacturer,finish_fabric,"
+                "INSERT INTO inventory (sku,description,manufacturer,finish_fabric,"
                 "warehouse_location,cost_price,retail_price,status,customer_name,order_id,"
                 "date_in,date_out,delivery_type,notes) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -1592,7 +1797,7 @@ def gb_inventory_add():
 
 
 @app.route("/api/gb/inventory/<int:item_id>", methods=["PUT"])
-def gb_inventory_update(item_id):
+def inventory_update(item_id):
     """Update an inventory item."""
     d = request.get_json() or {}
     fields = ['sku','description','manufacturer','finish_fabric','warehouse_location',
@@ -1603,7 +1808,7 @@ def gb_inventory_update(item_id):
         with _db() as conn:
             sets = ', '.join(f"{f}=?" for f in fields)
             vals = [d.get(f) for f in fields] + [item_id]
-            conn.execute(f"UPDATE gb_inventory SET {sets} WHERE id=?", vals)
+            conn.execute(f"UPDATE inventory SET {sets} WHERE id=?", vals)
             conn.commit()
         _log_activity(d.get('user_name',''), 'updateInventory',
                       d.get('description','item'), f"id:{item_id}")
@@ -1613,16 +1818,16 @@ def gb_inventory_update(item_id):
 
 
 @app.route("/api/gb/inventory/<int:item_id>", methods=["DELETE"])
-def gb_inventory_delete(item_id):
+def inventory_delete(item_id):
     """Delete an inventory item."""
     user_name = request.args.get('user_name', '')
     try:
         _init_db()
         with _db() as conn:
-            row = conn.execute("SELECT description FROM gb_inventory WHERE id=?",
+            row = conn.execute("SELECT description FROM inventory WHERE id=?",
                                (item_id,)).fetchone()
             desc = row['description'] if row else str(item_id)
-            conn.execute("DELETE FROM gb_inventory WHERE id=?", (item_id,))
+            conn.execute("DELETE FROM inventory WHERE id=?", (item_id,))
             conn.commit()
         _log_activity(user_name, 'deleteInventory', desc, f"id:{item_id}")
         return jsonify({'success': True})
@@ -1636,7 +1841,7 @@ def gb_attention():
     try:
         _init_db()
         with _db() as conn:
-            rows = conn.execute("SELECT * FROM gb_orders ORDER BY created_at DESC").fetchall()
+            rows = conn.execute("SELECT * FROM orders ORDER BY created_at DESC").fetchall()
         orders = [dict(r) for r in rows]
     except Exception as e:
         orders = []
@@ -1777,12 +1982,12 @@ def gb_calendar():
         with _db() as conn:
             # Outgoing: orders with a scheduled delivery date
             deliveries = conn.execute(
-                "SELECT id, customer_name, phone, items, delivery_date, status FROM gb_orders "
+                "SELECT id, customer_name, phone, items, delivery_date, status FROM orders "
                 "WHERE delivery_date BETWEEN ? AND ? AND delivery_date != ''",
                 (start, end)).fetchall()
             # Incoming: orders expected to arrive from manufacturer
             arrivals = conn.execute(
-                "SELECT id, customer_name, manufacturer, items, expected_date, status FROM gb_orders "
+                "SELECT id, customer_name, manufacturer, items, expected_date, status FROM orders "
                 "WHERE expected_date BETWEEN ? AND ? AND expected_date != ''",
                 (start, end)).fetchall()
             # Blocked days
@@ -1791,7 +1996,7 @@ def gb_calendar():
                 (start, end)).fetchall()
             # Standalone calendar delivery events (with times)
             events = conn.execute(
-                "SELECT * FROM gb_deliveries WHERE date BETWEEN ? AND ? ORDER BY date, time",
+                "SELECT * FROM deliveries WHERE date BETWEEN ? AND ? ORDER BY date, time",
                 (start, end)).fetchall()
         return jsonify({
             "deliveries": [dict(r) for r in deliveries],
@@ -1858,11 +2063,11 @@ def gb_get_deliveries():
         with _db() as conn:
             if date:
                 rows = conn.execute(
-                    "SELECT * FROM gb_deliveries WHERE date = ? ORDER BY time, id",
+                    "SELECT * FROM deliveries WHERE date = ? ORDER BY time, id",
                     (date,)).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT * FROM gb_deliveries ORDER BY date, time, id").fetchall()
+                    "SELECT * FROM deliveries ORDER BY date, time, id").fetchall()
         return jsonify({"deliveries": [dict(r) for r in rows]})
     except Exception as e:
         print(f"[gb/deliveries GET] {e}")
@@ -1881,7 +2086,7 @@ def gb_create_delivery():
         _init_db()
         with _db() as conn:
             cur = conn.execute(
-                "INSERT INTO gb_deliveries (date, time, direction, name, address, phone, items, notes, order_id) "
+                "INSERT INTO deliveries (date, time, direction, name, address, phone, items, notes, order_id) "
                 "VALUES (?,?,?,?,?,?,?,?,?)",
                 (str(data.get("date",      ""))[:20],
                  str(data.get("time",      ""))[:10],
@@ -1917,7 +2122,7 @@ def gb_update_delivery(del_id):
     try:
         _init_db()
         with _db() as conn:
-            conn.execute(f"UPDATE gb_deliveries SET {', '.join(fields)} WHERE id = ?", vals)
+            conn.execute(f"UPDATE deliveries SET {', '.join(fields)} WHERE id = ?", vals)
             conn.commit()
         return jsonify({"ok": True})
     except Exception as e:
@@ -1931,7 +2136,7 @@ def gb_delete_delivery(del_id):
     try:
         _init_db()
         with _db() as conn:
-            conn.execute("DELETE FROM gb_deliveries WHERE id = ?", (del_id,))
+            conn.execute("DELETE FROM deliveries WHERE id = ?", (del_id,))
             conn.commit()
         return jsonify({"ok": True})
     except Exception as e:
@@ -1968,10 +2173,10 @@ def gb_upload_doc(order_id):
             return jsonify({"error": "File too large (20 MB max)"}), 400
         _init_db()
         with _db() as conn:
-            row = conn.execute("SELECT customer_name FROM gb_orders WHERE id=?", (order_id,)).fetchone()
+            row = conn.execute("SELECT customer_name FROM orders WHERE id=?", (order_id,)).fetchone()
             customer = row["customer_name"] if row else "?"
             cur = conn.execute(
-                "INSERT INTO gb_docs (order_id, filename, filetype, filedata) VALUES (?,?,?,?)",
+                "INSERT INTO docs (order_id, filename, filetype, filedata) VALUES (?,?,?,?)",
                 (order_id, filename, filetype, filedata)
             )
             conn.commit()
@@ -1991,7 +2196,7 @@ def gb_list_docs(order_id):
         _init_db()
         with _db() as conn:
             rows = conn.execute(
-                "SELECT id, filename, filetype, uploaded_at FROM gb_docs WHERE order_id = ? ORDER BY uploaded_at DESC",
+                "SELECT id, filename, filetype, uploaded_at FROM docs WHERE order_id = ? ORDER BY uploaded_at DESC",
                 (order_id,)
             ).fetchall()
         return jsonify({"docs": [dict(r) for r in rows]})
@@ -2007,7 +2212,7 @@ def gb_serve_doc(doc_id):
         _init_db()
         with _db() as conn:
             row = conn.execute(
-                "SELECT filename, filetype, filedata FROM gb_docs WHERE id = ?", (doc_id,)
+                "SELECT filename, filetype, filedata FROM docs WHERE id = ?", (doc_id,)
             ).fetchone()
         if not row:
             return jsonify({"error": "Document not found"}), 404
@@ -2606,7 +2811,7 @@ def biz_onboard():
 # ── GREAT BRIDGE FURNITURE — ACTIVITY LOG ────────────────────────────────────
 
 @app.route("/api/gb/activity", methods=["GET"])
-def gb_activity_log():
+def activity_log():
     """Return the employee activity log.
     Optional query params:
       limit  — max rows (default 200, max 500)
@@ -2622,7 +2827,7 @@ def gb_activity_log():
         _init_db()
         with _db() as conn:
             rows = conn.execute(
-                "SELECT * FROM gb_activity_log ORDER BY id DESC LIMIT 1000"
+                "SELECT * FROM activity_log ORDER BY id DESC LIMIT 1000"
             ).fetchall()
         log = [dict(r) for r in rows]
         # Client-side filter (log rarely exceeds a few thousand rows)
@@ -2646,7 +2851,7 @@ def gb_activity_log():
 @app.route("/api/gb/search", methods=["GET"])
 def gb_customer_search():
     """
-    Partial-name customer search across gb_orders.
+    Partial-name customer search across orders.
     Query param: q — partial name (e.g. "jones")
     Returns unique customer cards with order count, phone, last order date,
     and latest expected date.
@@ -2659,7 +2864,7 @@ def gb_customer_search():
         with _db() as conn:
             rows = conn.execute(
                 "SELECT customer_name, phone, status, expected_date, created_at "
-                "FROM gb_orders WHERE LOWER(customer_name) LIKE ? "
+                "FROM orders WHERE LOWER(customer_name) LIKE ? "
                 "ORDER BY created_at DESC",
                 (f"%{q.lower()}%",)
             ).fetchall()
@@ -2715,16 +2920,16 @@ def gb_customer_profile():
         _init_db()
         with _db() as conn:
             orders = conn.execute(
-                "SELECT * FROM gb_orders "
+                "SELECT * FROM orders "
                 "WHERE LOWER(customer_name) = LOWER(?) "
                 "ORDER BY created_at DESC",
                 (name,)
             ).fetchall()
             # Doc counts for each matching order
             doc_rows = conn.execute(
-                "SELECT order_id, COUNT(*) as doc_count FROM gb_docs "
+                "SELECT order_id, COUNT(*) as doc_count FROM docs "
                 "WHERE order_id IN "
-                "  (SELECT id FROM gb_orders WHERE LOWER(customer_name) = LOWER(?)) "
+                "  (SELECT id FROM orders WHERE LOWER(customer_name) = LOWER(?)) "
                 "GROUP BY order_id",
                 (name,)
             ).fetchall()
@@ -3138,19 +3343,19 @@ def gb_ask():
         _init_db()
         with _db() as conn:
             orders = conn.execute(
-                "SELECT * FROM gb_orders WHERE created_at >= date('now','-90 days') "
+                "SELECT * FROM orders WHERE created_at >= date('now','-90 days') "
                 "ORDER BY created_at DESC"
             ).fetchall()
             orders_list = [dict(r) for r in orders]
 
             inv_rows = conn.execute(
-                "SELECT status, COUNT(*) as cnt FROM gb_inventory GROUP BY status"
+                "SELECT status, COUNT(*) as cnt FROM inventory GROUP BY status"
             ).fetchall()
             inv_summary = {r["status"]: r["cnt"] for r in inv_rows}
 
             activity = conn.execute(
                 "SELECT user_name, action, target, details, created_at "
-                "FROM gb_activity_log ORDER BY created_at DESC LIMIT 20"
+                "FROM activity_log ORDER BY created_at DESC LIMIT 20"
             ).fetchall()
             activity_list = [dict(r) for r in activity]
     except Exception as e:
@@ -3448,11 +3653,11 @@ def gb_set_ticket_doc(order_id):
         _init_db()
         with _db() as conn:
             cur = conn.execute(
-                "INSERT INTO gb_docs (order_id, filename, filetype, filedata, is_ticket) VALUES (?,?,?,?,1)",
+                "INSERT INTO docs (order_id, filename, filetype, filedata, is_ticket) VALUES (?,?,?,?,1)",
                 (order_id, filename, filetype, raw)
             )
             doc_id = cur.lastrowid
-            conn.execute("UPDATE gb_orders SET ticket_doc_id=? WHERE id=?", (doc_id, order_id))
+            conn.execute("UPDATE orders SET ticket_doc_id=? WHERE id=?", (doc_id, order_id))
             conn.commit()
         _log_activity(user, "Attached ticket scan", f"to order #{order_id}", f"File: {filename}")
         return jsonify({"ok": True, "doc_id": doc_id})
@@ -3473,7 +3678,7 @@ def gb_proposal(order_id):
         _init_db()
         with _db() as conn:
             row = conn.execute(
-                "SELECT * FROM gb_orders WHERE id = ?", (order_id,)
+                "SELECT * FROM orders WHERE id = ?", (order_id,)
             ).fetchone()
     except Exception as e:
         return f"<html><body>Database error: {e}</body></html>", 500
@@ -3587,7 +3792,7 @@ def gb_proposal(order_id):
 @app.route('/api/gb/manufacturers', methods=['GET'])
 def gb_list_manufacturers():
     conn = _db()
-    rows = conn.execute("SELECT * FROM gb_manufacturers ORDER BY name").fetchall()
+    rows = conn.execute("SELECT * FROM manufacturers ORDER BY name").fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
 
@@ -3598,7 +3803,7 @@ def gb_create_manufacturer():
     conn = _db()
     c = conn.cursor()
     c.execute(
-        "INSERT INTO gb_manufacturers (name,contact_person,email,phone,fax,address,notes) VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO manufacturers (name,contact_person,email,phone,fax,address,notes) VALUES (?,?,?,?,?,?,?)",
         (data.get('name',''), data.get('contact_person',''), data.get('email',''),
          data.get('phone',''), data.get('fax',''), data.get('address',''), data.get('notes',''))
     )
@@ -3613,7 +3818,7 @@ def gb_update_manufacturer(mid):
     data = request.json or {}
     conn = _db()
     conn.execute(
-        "UPDATE gb_manufacturers SET name=?,contact_person=?,email=?,phone=?,fax=?,address=?,notes=? WHERE id=?",
+        "UPDATE manufacturers SET name=?,contact_person=?,email=?,phone=?,fax=?,address=?,notes=? WHERE id=?",
         (data.get('name',''), data.get('contact_person',''), data.get('email',''),
          data.get('phone',''), data.get('fax',''), data.get('address',''), data.get('notes',''), mid)
     )
@@ -3625,7 +3830,7 @@ def gb_update_manufacturer(mid):
 @app.route('/api/gb/manufacturers/<int:mid>', methods=['DELETE'])
 def gb_delete_manufacturer(mid):
     conn = _db()
-    conn.execute("DELETE FROM gb_manufacturers WHERE id=?", (mid,))
+    conn.execute("DELETE FROM manufacturers WHERE id=?", (mid,))
     conn.commit()
     conn.close()
     return jsonify({'ok': True})
@@ -3699,7 +3904,7 @@ def gb_send_po(oid):
     user_name = data.get('user_name', 'Staff')
 
     conn  = _db()
-    order = conn.execute("SELECT * FROM gb_orders WHERE id=?", (oid,)).fetchone()
+    order = conn.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
     if not order:
         conn.close()
         return jsonify({'error': 'Order not found'}), 404
@@ -3708,11 +3913,11 @@ def gb_send_po(oid):
     # Look up manufacturer — try manufacturer_id first, then match by name
     manufacturer = None
     if order.get('manufacturer_id'):
-        row = conn.execute("SELECT * FROM gb_manufacturers WHERE id=?", (order['manufacturer_id'],)).fetchone()
+        row = conn.execute("SELECT * FROM manufacturers WHERE id=?", (order['manufacturer_id'],)).fetchone()
         if row:
             manufacturer = dict(row)
     if not manufacturer and order.get('manufacturer'):
-        row = conn.execute("SELECT * FROM gb_manufacturers WHERE name LIKE ?",
+        row = conn.execute("SELECT * FROM manufacturers WHERE name LIKE ?",
                            (f"%{order['manufacturer']}%",)).fetchone()
         if row:
             manufacturer = dict(row)
@@ -3737,7 +3942,7 @@ def gb_send_po(oid):
 
     import datetime as _dt_po2
     now = _dt_po2.datetime.now().isoformat(sep=' ', timespec='seconds')
-    conn.execute("UPDATE gb_orders SET po_sent_at=? WHERE id=?", (now, oid))
+    conn.execute("UPDATE orders SET po_sent_at=? WHERE id=?", (now, oid))
     conn.commit()
     _log_activity(user_name, 'send_po', f'Order #{oid}', f'PO emailed to {to_email} ({mfr_name})')
     conn.close()
@@ -3749,14 +3954,14 @@ def gb_send_po(oid):
 def gb_po_preview(oid):
     """Return the PO as a printable HTML page (opens in new tab)."""
     conn  = _db()
-    order = conn.execute("SELECT * FROM gb_orders WHERE id=?", (oid,)).fetchone()
+    order = conn.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
     if not order:
         conn.close()
         return "Order not found", 404
     order        = dict(order)
     manufacturer = None
     if order.get('manufacturer_id'):
-        row = conn.execute("SELECT * FROM gb_manufacturers WHERE id=?", (order['manufacturer_id'],)).fetchone()
+        row = conn.execute("SELECT * FROM manufacturers WHERE id=?", (order['manufacturer_id'],)).fetchone()
         if row:
             manufacturer = dict(row)
     conn.close()
