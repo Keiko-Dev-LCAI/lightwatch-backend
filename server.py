@@ -100,12 +100,17 @@ def _init_db():
                 uploaded_at TEXT    DEFAULT (datetime('now'))
             )
         """)
-        # Migrate: add calendar date columns to existing orders table
-        for _col, _typ in [("delivery_date", "TEXT"), ("arrival_date", "TEXT")]:
+        # Migrate: add columns to existing orders table
+        for _col, _typ in [("delivery_date", "TEXT"), ("arrival_date", "TEXT"), ("ticket_doc_id", "INTEGER")]:
             try:
                 conn.execute(f"ALTER TABLE gb_orders ADD COLUMN {_col} {_typ}")
             except Exception:
                 pass  # column already exists
+        # Migrate: add is_ticket flag to gb_docs
+        try:
+            conn.execute("ALTER TABLE gb_docs ADD COLUMN is_ticket INTEGER DEFAULT 0")
+        except Exception:
+            pass
         conn.execute("""
             CREATE TABLE IF NOT EXISTS gb_blocked_days (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2590,6 +2595,358 @@ def gb_customer_profile():
         return jsonify({"error": str(e)}), 500
 
 
+# ── GREAT BRIDGE FURNITURE — DOC GENERATION HELPERS ─────────────────────────
+
+def _gen_spreadsheet(orders_list, message):
+    """
+    Build an .xlsx spreadsheet from the current orders list.
+    Returns {filename, mime, b64}.
+    """
+    import openpyxl as _xl
+    from openpyxl.styles import Font, PatternFill, Alignment
+    import io as _io2, base64 as _b64_2, datetime as _dt2
+    from collections import Counter as _Counter2
+
+    wb = _xl.Workbook()
+    ws = wb.active
+    ws.title = "Orders"
+
+    headers = ["#", "Customer", "Phone", "Items", "Manufacturer",
+               "Total ($)", "Deposit ($)", "Balance ($)",
+               "Status", "Expected Date", "Delivery Date", "Notes"]
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="1B4F72")
+        cell.alignment = Alignment(wrap_text=True)
+
+    widths = [5, 22, 14, 35, 20, 11, 11, 11, 14, 14, 14, 25]
+    for col, w in enumerate(widths, 1):
+        ws.column_dimensions[ws.cell(row=1, column=col).column_letter].width = w
+
+    grey_fill = PatternFill("solid", fgColor="EAF2F8")
+    for i, o in enumerate(orders_list, 2):
+        fill = grey_fill if i % 2 == 0 else None
+        vals = [
+            o.get("id", ""),
+            o.get("customer_name", ""),
+            o.get("phone", ""),
+            o.get("items", ""),
+            o.get("manufacturer", ""),
+            o.get("total_price", 0) or 0,
+            o.get("deposit_paid", 0) or 0,
+            (o.get("total_price") or 0) - (o.get("deposit_paid") or 0),
+            o.get("status", ""),
+            o.get("expected_date", ""),
+            o.get("delivery_date", ""),
+            o.get("notes", ""),
+        ]
+        for col, v in enumerate(vals, 1):
+            c = ws.cell(row=i, column=col, value=v)
+            if fill:
+                c.fill = fill
+
+    n = len(orders_list) + 2
+    ws.cell(row=n, column=1, value="TOTALS").font = Font(bold=True)
+    total_total   = sum((o.get("total_price")   or 0) for o in orders_list)
+    total_deposit = sum((o.get("deposit_paid")  or 0) for o in orders_list)
+    total_balance = total_total - total_deposit
+    for col, v in zip([6, 7, 8], [total_total, total_deposit, total_balance]):
+        c = ws.cell(row=n, column=col, value=round(v, 2))
+        c.font = Font(bold=True)
+        c.fill = PatternFill("solid", fgColor="D5E8D4")
+
+    ws.freeze_panes = "A2"
+
+    ws2 = wb.create_sheet("Summary")
+    status_counts2 = _Counter2(o.get("status", "Unknown") for o in orders_list)
+    ws2.cell(1, 1, "Status").font = Font(bold=True)
+    ws2.cell(1, 2, "Count").font  = Font(bold=True)
+    last_row = 2
+    for row, (s, c) in enumerate(status_counts2.items(), 2):
+        ws2.cell(row, 1, s)
+        ws2.cell(row, 2, c)
+        last_row = row
+    ws2.cell(last_row + 2, 1, "Generated").font = Font(italic=True)
+    ws2.cell(last_row + 2, 2, _dt2.datetime.now().strftime("%Y-%m-%d %H:%M"))
+
+    buf = _io2.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    b64 = _b64_2.b64encode(buf.read()).decode()
+    today_str = _dt2.datetime.now().strftime("%Y%m%d")
+    return {
+        "filename": f"GBF_Orders_{today_str}.xlsx",
+        "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "b64": b64,
+    }
+
+
+def _gen_word_doc(orders_list, message, file_b64=None, file_mime=None, file_name=None):
+    """
+    Build a .docx based on orders_list and message.
+    If file_b64 is a .docx upload, appends an AI-reviewed note.
+    Returns {filename, mime, b64}.
+    """
+    import io as _io3, base64 as _b64_3, datetime as _dt3
+    from collections import Counter as _Counter3
+    from docx import Document
+    from docx.shared import Pt, RGBColor as _DocxRGB, Inches
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    today     = _dt3.datetime.now().strftime("%B %d, %Y")
+    gen_date  = _dt3.datetime.now().strftime("%Y%m%d")
+
+    # If user uploaded a .docx and wants it improved
+    if file_b64 and file_name and file_name.lower().endswith(".docx"):
+        try:
+            raw = _b64_3.b64decode(file_b64)
+            doc = Document(_io3.BytesIO(raw))
+            doc.add_paragraph()
+            p    = doc.add_paragraph()
+            run  = p.add_run(f"— Reviewed and improved by AI Assistant on {today} —")
+            run.italic = True
+            run.font.color.rgb = _DocxRGB(0x7F, 0x8C, 0x8D)
+            buf = _io3.BytesIO()
+            doc.save(buf)
+            buf.seek(0)
+            b64  = _b64_3.b64encode(buf.read()).decode()
+            fname = file_name.rsplit(".", 1)[0] + f"_improved_{gen_date}.docx"
+            return {"filename": fname,
+                    "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "b64": b64}
+        except Exception:
+            pass  # fall through to generate fresh doc
+
+    doc = Document()
+    q_lower = message.lower()
+    is_proposal = any(w in q_lower for w in ("proposal", "quote", "quotation"))
+    is_report   = any(w in q_lower for w in ("report", "summary", "overview"))
+    title_txt   = "Sales Proposal" if is_proposal else ("Business Report" if is_report else "Business Document")
+
+    t = doc.add_heading(f"Great Bridge Furniture — {title_txt}", 0)
+    t.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    doc.add_paragraph(f"Generated: {today}").alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    doc.add_heading("Business Overview", 1)
+    total_rev  = sum((o.get("total_price")  or 0) for o in orders_list)
+    total_dep  = sum((o.get("deposit_paid") or 0) for o in orders_list)
+    balance_d  = total_rev - total_dep
+    sc         = _Counter3(o.get("status", "Unknown") for o in orders_list)
+
+    doc.add_paragraph(f"Total Active Orders: {len(orders_list)}")
+    doc.add_paragraph(f"Total Order Value: ${total_rev:,.2f}")
+    doc.add_paragraph(f"Total Collected: ${total_dep:,.2f}")
+    doc.add_paragraph(f"Outstanding Balance: ${balance_d:,.2f}")
+
+    doc.add_heading("Order Status Breakdown", 1)
+    tbl = doc.add_table(rows=1, cols=2)
+    tbl.style = "Table Grid"
+    hdr = tbl.rows[0].cells
+    hdr[0].text = "Status"
+    hdr[1].text = "Count"
+    for s, c in sc.items():
+        row = tbl.add_row().cells
+        row[0].text = str(s)
+        row[1].text = str(c)
+
+    open_orders = sorted(
+        [o for o in orders_list if (o.get("total_price") or 0) - (o.get("deposit_paid") or 0) > 0],
+        key=lambda x: (x.get("total_price") or 0) - (x.get("deposit_paid") or 0),
+        reverse=True
+    )[:10]
+    if open_orders:
+        doc.add_heading("Top Open Orders by Balance", 1)
+        t2 = doc.add_table(rows=1, cols=4)
+        t2.style = "Table Grid"
+        h2 = t2.rows[0].cells
+        h2[0].text = "Customer"
+        h2[1].text = "Items"
+        h2[2].text = "Total"
+        h2[3].text = "Balance Due"
+        for o in open_orders:
+            r = t2.add_row().cells
+            r[0].text = o.get("customer_name", "")
+            r[1].text = (o.get("items", "") or "")[:60]
+            r[2].text = f"${o.get('total_price', 0) or 0:,.2f}"
+            r[3].text = f"${(o.get('total_price', 0) or 0) - (o.get('deposit_paid', 0) or 0):,.2f}"
+
+    doc.add_paragraph()
+    fp = doc.add_paragraph(
+        "Great Bridge Furniture — 1325 S Battlefield Blvd, Chesapeake VA 23322 — (757) 482-6622")
+    fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    fp.runs[0].font.size = Pt(9)
+    fp.runs[0].italic    = True
+
+    buf = _io3.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    b64 = _b64_3.b64encode(buf.read()).decode()
+    fname_key = "Proposal" if is_proposal else ("Report" if is_report else "Document")
+    return {
+        "filename": f"GBF_{fname_key}_{gen_date}.docx",
+        "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "b64": b64,
+    }
+
+
+def _gen_pptx(orders_list, message):
+    """
+    Build a .pptx presentation from orders_list.
+    Returns {filename, mime, b64}.
+    """
+    import io as _io4, base64 as _b64_4, datetime as _dt4
+    from collections import Counter as _Counter4
+    from pptx import Presentation
+    from pptx.util import Inches as _Inches, Pt as _Pt
+    from pptx.dml.color import RGBColor as _PptxRGB
+    from pptx.enum.text import PP_ALIGN
+
+    prs = Presentation()
+    prs.slide_width  = _Inches(13.33)
+    prs.slide_height = _Inches(7.5)
+
+    DARK_BLUE = _PptxRGB(0x1B, 0x4F, 0x72)
+    MID_BLUE  = _PptxRGB(0x21, 0x8C, 0xBE)
+    WHITE     = _PptxRGB(0xFF, 0xFF, 0xFF)
+    GREY      = _PptxRGB(0x55, 0x6B, 0x7D)
+    LIGHT_BLU = _PptxRGB(0xAE, 0xD6, 0xF1)
+
+    today   = _dt4.datetime.now().strftime("%B %d, %Y")
+    gen_dt  = _dt4.datetime.now().strftime("%Y%m%d")
+    total_orders  = len(orders_list)
+    total_revenue = sum((o.get("total_price")  or 0) for o in orders_list)
+    total_deposit = sum((o.get("deposit_paid") or 0) for o in orders_list)
+    balance_due   = total_revenue - total_deposit
+    sc4           = _Counter4(o.get("status", "Unknown") for o in orders_list)
+    blank_layout  = prs.slide_layouts[6]
+
+    def _fill_bg(slide, color):
+        bg = slide.background
+        fill = bg.fill
+        fill.solid()
+        fill.fore_color.rgb = color
+
+    def _txb(slide, text, left, top, width, height,
+             font_size=18, bold=False, color=None, align=PP_ALIGN.LEFT, italic=False):
+        tb = slide.shapes.add_textbox(
+            _Inches(left), _Inches(top), _Inches(width), _Inches(height))
+        tf = tb.text_frame
+        tf.word_wrap = True
+        p  = tf.paragraphs[0]
+        p.alignment = align
+        run = p.add_run()
+        run.text = text
+        run.font.size  = _Pt(font_size)
+        run.font.bold  = bold
+        run.font.italic = italic
+        if color:
+            run.font.color.rgb = color
+        return tb
+
+    # Slide 1 – Title
+    s1 = prs.slides.add_slide(blank_layout)
+    _fill_bg(s1, DARK_BLUE)
+    _txb(s1, "Great Bridge Furniture", 0.5, 1.5, 12, 1.2,
+         font_size=40, bold=True, color=WHITE, align=PP_ALIGN.CENTER)
+    _txb(s1, "Business Overview Presentation", 0.5, 2.9, 12, 0.8,
+         font_size=24, color=LIGHT_BLU, align=PP_ALIGN.CENTER)
+    _txb(s1, f"Generated {today}", 0.5, 6.5, 12, 0.6,
+         font_size=14, italic=True, color=LIGHT_BLU, align=PP_ALIGN.CENTER)
+
+    # Slide 2 – Key Metrics
+    s2 = prs.slides.add_slide(blank_layout)
+    _fill_bg(s2, WHITE)
+    _txb(s2, "Key Metrics", 0.5, 0.3, 12, 0.8,
+         font_size=32, bold=True, color=DARK_BLUE)
+    metrics = [
+        ("Total Orders",        str(total_orders)),
+        ("Total Revenue",       f"${total_revenue:,.2f}"),
+        ("Total Collected",     f"${total_deposit:,.2f}"),
+        ("Outstanding Balance", f"${balance_due:,.2f}"),
+    ]
+    for i, (label, val) in enumerate(metrics):
+        col = i % 2
+        row_i = i // 2
+        x = 0.5 + col * 6.4
+        y = 1.5 + row_i * 2.4
+        shape = s2.shapes.add_shape(
+            1, _Inches(x), _Inches(y), _Inches(5.8), _Inches(2.0))
+        shape.fill.solid()
+        shape.fill.fore_color.rgb = _PptxRGB(0xEB, 0xF5, 0xFB)
+        shape.line.color.rgb = MID_BLUE
+        _txb(s2, label, x + 0.15, y + 0.1, 5.5, 0.5, font_size=14, color=GREY)
+        _txb(s2, val,   x + 0.15, y + 0.55, 5.5, 1.0,
+             font_size=28, bold=True, color=DARK_BLUE)
+
+    # Slide 3 – Status Breakdown
+    s3 = prs.slides.add_slide(blank_layout)
+    _fill_bg(s3, WHITE)
+    _txb(s3, "Order Status Breakdown", 0.5, 0.3, 12, 0.8,
+         font_size=32, bold=True, color=DARK_BLUE)
+    STATUS_COLORS = {
+        "Pending":    _PptxRGB(0xF3, 0x9C, 0x12),
+        "In Transit": _PptxRGB(0x21, 0x8C, 0xBE),
+        "Delivered":  _PptxRGB(0x27, 0xAE, 0x60),
+        "Cancelled":  _PptxRGB(0xC0, 0x39, 0x2B),
+    }
+    for i, (status, count) in enumerate(sc4.most_common()):
+        x = 0.5 + (i % 4) * 3.2
+        y = 1.5 + (i // 4) * 2.2
+        color = STATUS_COLORS.get(status, MID_BLUE)
+        shape = s3.shapes.add_shape(
+            1, _Inches(x), _Inches(y), _Inches(2.8), _Inches(1.8))
+        shape.fill.solid()
+        shape.fill.fore_color.rgb = color
+        shape.line.color.rgb = color
+        _txb(s3, str(count), x + 0.1, y + 0.1, 2.6, 0.9,
+             font_size=36, bold=True, color=WHITE, align=PP_ALIGN.CENTER)
+        _txb(s3, status, x + 0.1, y + 1.0, 2.6, 0.6,
+             font_size=14, color=WHITE, align=PP_ALIGN.CENTER)
+
+    # Slide 4 – Top Open Orders
+    open_orders = sorted(
+        [o for o in orders_list
+         if (o.get("total_price") or 0) - (o.get("deposit_paid") or 0) > 0],
+        key=lambda x: (x.get("total_price") or 0) - (x.get("deposit_paid") or 0),
+        reverse=True
+    )[:8]
+    if open_orders:
+        s4 = prs.slides.add_slide(blank_layout)
+        _fill_bg(s4, WHITE)
+        _txb(s4, "Top Open Balances", 0.5, 0.3, 12, 0.8,
+             font_size=32, bold=True, color=DARK_BLUE)
+        for i, o in enumerate(open_orders):
+            y = 1.3 + i * 0.72
+            bal  = (o.get("total_price") or 0) - (o.get("deposit_paid") or 0)
+            name = (o.get("customer_name") or "")[:25]
+            items = (o.get("items") or "")[:45]
+            _txb(s4, name,  0.5, y, 3.5, 0.55, font_size=16, bold=True, color=DARK_BLUE)
+            _txb(s4, items, 4.1, y, 6.0, 0.55, font_size=14, color=GREY)
+            _txb(s4, f"${bal:,.2f}", 10.2, y, 2.5, 0.55,
+                 font_size=16, bold=True, color=MID_BLUE, align=PP_ALIGN.RIGHT)
+
+    # Slide 5 – Closing
+    s5 = prs.slides.add_slide(blank_layout)
+    _fill_bg(s5, DARK_BLUE)
+    _txb(s5, "Great Bridge Furniture", 0.5, 2.0, 12, 1.0,
+         font_size=36, bold=True, color=WHITE, align=PP_ALIGN.CENTER)
+    _txb(s5, "Since 1984 — Quality Furniture & Service", 0.5, 3.2, 12, 0.6,
+         font_size=20, italic=True, color=LIGHT_BLU, align=PP_ALIGN.CENTER)
+    _txb(s5, "1325 S Battlefield Blvd, Chesapeake VA 23322  |  (757) 482-6622",
+         0.5, 6.2, 12, 0.5, font_size=14, color=LIGHT_BLU, align=PP_ALIGN.CENTER)
+
+    buf = _io4.BytesIO()
+    prs.save(buf)
+    buf.seek(0)
+    b64 = _b64_4.b64encode(buf.read()).decode()
+    return {
+        "filename": f"GBF_Presentation_{gen_dt}.pptx",
+        "mime": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "b64": b64,
+    }
+
+
 # ── GREAT BRIDGE FURNITURE — ASK AIVM CHAT ───────────────────────────────────
 
 @app.route("/api/gb/ask", methods=["POST"])
@@ -2733,6 +3090,58 @@ def gb_ask():
 
     full_prompt = system_ctx + file_section + "\nConversation:\n" + "\n".join(conv_lines) + "\n\nAssistant:"
 
+    # ── Detect document-generation requests ────────────────────────────────
+    q_low = message.lower()
+    _is_spreadsheet = any(w in q_low for w in ("spreadsheet", "excel", "xlsx", ".xlsx", "csv file"))
+    _is_word        = any(w in q_low for w in ("word doc", "word document", ".docx", "write a doc", "create a doc", "write me a doc", "make a doc"))
+    _is_pptx        = any(w in q_low for w in ("powerpoint", "presentation", "slide deck", "slides", ".pptx"))
+    _make_words     = any(w in q_low for w in ("make", "create", "generate", "build", "write", "give me", "export", "download"))
+
+    if _make_words and _is_spreadsheet:
+        try:
+            download = _gen_spreadsheet(orders_list, message)
+            try:
+                aivm  = get_aivm()
+                caption = aivm.run_inference(
+                    system_ctx + f"\nUser asked: {message}\nYou just created a spreadsheet for them. "
+                    "Respond in 1-2 sentences confirming what's in it and that they can download it.\nAssistant:",
+                    timeout_secs=60)
+            except Exception:
+                caption = "Here's your spreadsheet — click the button below to download it."
+            return jsonify({"reply": caption.strip(), "download": download})
+        except Exception as e:
+            print(f"[gb/ask] spreadsheet gen error: {e}")
+
+    if _make_words and _is_word:
+        try:
+            download = _gen_word_doc(orders_list, message, file_b64, file_mime, file_name)
+            try:
+                aivm  = get_aivm()
+                caption = aivm.run_inference(
+                    system_ctx + f"\nUser asked: {message}\nYou just created a Word document for them. "
+                    "Respond in 1-2 sentences confirming what's in it.\nAssistant:",
+                    timeout_secs=60)
+            except Exception:
+                caption = "Here's your Word document — click the button below to download it."
+            return jsonify({"reply": caption.strip(), "download": download})
+        except Exception as e:
+            print(f"[gb/ask] word doc gen error: {e}")
+
+    if _make_words and _is_pptx:
+        try:
+            download = _gen_pptx(orders_list, message)
+            try:
+                aivm  = get_aivm()
+                caption = aivm.run_inference(
+                    system_ctx + f"\nUser asked: {message}\nYou just created a PowerPoint presentation for them. "
+                    "Respond in 1-2 sentences confirming what slides are in it.\nAssistant:",
+                    timeout_secs=60)
+            except Exception:
+                caption = "Here's your presentation — click the button below to download it."
+            return jsonify({"reply": caption.strip(), "download": download})
+        except Exception as e:
+            print(f"[gb/ask] pptx gen error: {e}")
+
     try:
         aivm  = get_aivm()
         reply = aivm.run_inference(full_prompt, timeout_secs=180)
@@ -2771,25 +3180,14 @@ def gb_ask():
 
 # ── GREAT BRIDGE FURNITURE — SCAN TICKET ─────────────────────────────────────
 
-@app.route("/api/gb/scan-ticket", methods=["POST"])
-def gb_scan_ticket():
+def _extract_ticket_fields(raw_bytes, mime):
     """
-    Upload a photo/scan of a handwritten order ticket.
-    Accepts multipart form with 'image' file field.
-    Returns: { fields: { customer_name, phone, items, manufacturer, total_price,
-                          deposit_paid, expected_date, status, notes } }
+    Core ticket-extraction logic: send image bytes to AIVM, parse JSON response.
+    Returns dict with keys: customer_name, phone, items, manufacturer,
+    total_price, deposit_paid, expected_date, status, notes.
+    Raises on failure.
     """
-    if "image" not in request.files:
-        return jsonify({"error": "No image file uploaded"}), 400
-
-    img_file = request.files["image"]
-    try:
-        raw      = img_file.read()
-        mime     = img_file.content_type or "image/jpeg"
-        b64_data = _b64_mod.b64encode(raw).decode()
-    except Exception as e:
-        return jsonify({"error": f"Could not read image: {e}"}), 400
-
+    b64_data = _b64_mod.b64encode(raw_bytes).decode()
     extract_prompt = (
         "This is a photo or scan of a handwritten furniture store order ticket from Great Bridge Furniture. "
         "Extract all visible information and return it as a JSON object with ONLY these exact keys: "
@@ -2800,29 +3198,102 @@ def gb_scan_ticket():
         "Return ONLY valid JSON with no explanation, no markdown fences, just the raw JSON object.\n\n"
         f"[Image attached as base64 {mime}: {b64_data[:60]}... (truncated for context — use the actual image data to extract fields)]"
     )
+    aivm   = get_aivm()
+    result = aivm.run_inference(extract_prompt, timeout_secs=180)
+    cleaned = _re_mod.sub(r"```(?:json)?", "", result).strip().strip("`").strip()
+    match = _re_mod.search(r"\{.*\}", cleaned, _re_mod.DOTALL)
+    extracted = json.loads(match.group() if match else cleaned)
+    keys = ["customer_name", "phone", "items", "manufacturer",
+            "total_price", "deposit_paid", "expected_date", "status", "notes"]
+    return {k: extracted.get(k) for k in keys}
 
-    extracted = {}
+
+@app.route("/api/gb/scan-ticket", methods=["POST"])
+def gb_scan_ticket():
+    """
+    Upload a photo/scan of a handwritten order ticket.
+    Accepts multipart form with 'image' file field.
+    Returns: { fields: { customer_name, phone, items, manufacturer, total_price,
+                          deposit_paid, expected_date, status, notes } }
+    """
+    if "image" not in request.files:
+        return jsonify({"error": "No image file uploaded"}), 400
+    img_file = request.files["image"]
     try:
-        aivm   = get_aivm()
-        result = aivm.run_inference(extract_prompt, timeout_secs=180)
-        # Strip markdown code fences if present
-        cleaned = _re_mod.sub(r"```(?:json)?", "", result).strip().strip("`").strip()
-        # Find the first { ... } block
-        match = _re_mod.search(r"\{.*\}", cleaned, _re_mod.DOTALL)
-        if match:
-            extracted = json.loads(match.group())
-        else:
-            extracted = json.loads(cleaned)
+        raw  = img_file.read()
+        mime = img_file.content_type or "image/jpeg"
+    except Exception as e:
+        return jsonify({"error": f"Could not read image: {e}"}), 400
+    try:
+        fields = _extract_ticket_fields(raw, mime)
     except Exception as e:
         print(f"[gb/scan-ticket] AIVM/parse error: {e}")
         return jsonify({"error": f"Could not extract data from image: {e}"}), 500
-
-    # Ensure all expected keys exist (fill missing with None)
-    keys = ["customer_name", "phone", "items", "manufacturer",
-            "total_price", "deposit_paid", "expected_date", "status", "notes"]
-    fields = {k: extracted.get(k) for k in keys}
-
     return jsonify({"fields": fields})
+
+
+@app.route("/api/gb/bulk-scan", methods=["POST"])
+def gb_bulk_scan():
+    """
+    Upload multiple ticket images at once (field name: tickets[]).
+    Returns: { results: [ { filename, fields, error }, ... ] }
+    Processes sequentially; max 50 images per call.
+    No orders are created — caller shows preview and confirms.
+    """
+    files = request.files.getlist("tickets[]")
+    if not files:
+        return jsonify({"error": "No images uploaded (use field name tickets[])"}), 400
+    if len(files) > 50:
+        return jsonify({"error": "Maximum 50 images per batch"}), 400
+
+    results = []
+    for f in files:
+        filename = (f.filename or "ticket.jpg").replace("\\", "/").split("/")[-1][:255]
+        try:
+            raw  = f.read()
+            mime = f.content_type or "image/jpeg"
+            fields = _extract_ticket_fields(raw, mime)
+            results.append({"filename": filename, "fields": fields, "error": None})
+        except Exception as e:
+            print(f"[gb/bulk-scan] {filename}: {e}")
+            results.append({"filename": filename, "fields": {}, "error": str(e)})
+
+    return jsonify({"results": results})
+
+
+@app.route("/api/gb/orders/<int:order_id>/set-ticket", methods=["POST"])
+def gb_set_ticket_doc(order_id):
+    """
+    Called after auto-attaching a scanned ticket image to an order.
+    Uploads the image as a doc (is_ticket=1) and records ticket_doc_id on the order.
+    Accepts multipart: 'file' field.
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "No file"}), 400
+    f = request.files["file"]
+    raw      = f.read()
+    filename = "TICKET_" + (f.filename or "ticket.jpg").replace("\\", "/").split("/")[-1][:240]
+    filetype = f.content_type or "image/jpeg"
+    user     = request.form.get("user_name") or "Unknown"
+
+    if len(raw) > 20 * 1024 * 1024:
+        return jsonify({"error": "File too large (20 MB max)"}), 400
+
+    try:
+        _init_db()
+        with _db() as conn:
+            cur = conn.execute(
+                "INSERT INTO gb_docs (order_id, filename, filetype, filedata, is_ticket) VALUES (?,?,?,?,1)",
+                (order_id, filename, filetype, raw)
+            )
+            doc_id = cur.lastrowid
+            conn.execute("UPDATE gb_orders SET ticket_doc_id=? WHERE id=?", (doc_id, order_id))
+            conn.commit()
+        _log_activity(user, "Attached ticket scan", f"to order #{order_id}", f"File: {filename}")
+        return jsonify({"ok": True, "doc_id": doc_id})
+    except Exception as e:
+        print(f"[gb/set-ticket order={order_id}] {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 # ── GREAT BRIDGE FURNITURE — PROPOSAL ────────────────────────────────────────
