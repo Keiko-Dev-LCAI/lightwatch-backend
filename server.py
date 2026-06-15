@@ -180,6 +180,29 @@ def _init_db():
                 created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS gb_manufacturers (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                name           TEXT NOT NULL,
+                contact_person TEXT DEFAULT '',
+                email          TEXT DEFAULT '',
+                phone          TEXT DEFAULT '',
+                fax            TEXT DEFAULT '',
+                address        TEXT DEFAULT '',
+                notes          TEXT DEFAULT '',
+                created_at     TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        # Migrate gb_orders: add manufacturer_id FK column
+        try:
+            conn.execute("ALTER TABLE gb_orders ADD COLUMN manufacturer_id INTEGER")
+        except Exception:
+            pass
+        # Migrate gb_orders: add po_sent_at column
+        try:
+            conn.execute("ALTER TABLE gb_orders ADD COLUMN po_sent_at TEXT")
+        except Exception:
+            pass
         conn.commit()
 
 try:
@@ -201,6 +224,139 @@ def _log_activity(user: str, action: str, target: str = "", details: str = ""):
             conn.commit()
     except Exception as _e:
         print(f"[activity_log] {_e}")
+
+
+# ── GBF EMAIL + PO HELPERS ───────────────────────────────────────────────────
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+GBF_EMAIL_ADDRESS  = os.environ.get('GBF_EMAIL_ADDRESS', '')
+GBF_EMAIL_PASSWORD = os.environ.get('GBF_EMAIL_PASSWORD', '')
+
+
+def _send_aol_email(to_email, subject, html_body):
+    """Send email via AOL SMTP using env-var credentials."""
+    if not GBF_EMAIL_ADDRESS or not GBF_EMAIL_PASSWORD:
+        raise ValueError("GBF_EMAIL_ADDRESS and GBF_EMAIL_PASSWORD env vars not set")
+    msg = MIMEMultipart('alternative')
+    msg['Subject']  = subject
+    msg['From']     = f"Great Bridge Furniture <{GBF_EMAIL_ADDRESS}>"
+    msg['To']       = to_email
+    msg['Reply-To'] = GBF_EMAIL_ADDRESS
+    msg.attach(MIMEText(html_body, 'html'))
+    with smtplib.SMTP('smtp.aol.com', 587) as smtp:
+        smtp.ehlo()
+        smtp.starttls()
+        smtp.login(GBF_EMAIL_ADDRESS, GBF_EMAIL_PASSWORD)
+        smtp.send_message(msg)
+
+
+def _gen_po_html(order, manufacturer):
+    """Generate a professional Purchase Order as HTML."""
+    import datetime as _dt_po
+    po_number  = f"GBF-{_dt_po.date.today().strftime('%Y%m%d')}-{order['id']:04d}"
+    today      = _dt_po.date.today().strftime('%B %d, %Y')
+    mfr_name    = manufacturer.get('name', order.get('manufacturer', '')) if manufacturer else order.get('manufacturer', '')
+    mfr_contact = manufacturer.get('contact_person', '') if manufacturer else ''
+    mfr_email   = manufacturer.get('email', '')          if manufacturer else ''
+    mfr_address = manufacturer.get('address', '')        if manufacturer else ''
+
+    return f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8">
+<style>
+  body {{ font-family: Arial, sans-serif; font-size: 14px; color: #222; margin: 0; padding: 0; }}
+  .po-wrap {{ max-width: 700px; margin: 0 auto; padding: 40px 32px; }}
+  .header {{ display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 3px solid #1a3a6b; padding-bottom: 20px; margin-bottom: 28px; }}
+  .store-name {{ font-size: 26px; font-weight: 700; color: #1a3a6b; }}
+  .store-info {{ font-size: 12px; color: #555; margin-top: 4px; }}
+  .po-title {{ text-align: right; }}
+  .po-title h1 {{ font-size: 28px; font-weight: 700; color: #1a3a6b; margin: 0; }}
+  .po-title .po-num {{ font-size: 14px; color: #444; margin-top: 4px; }}
+  .po-title .po-date {{ font-size: 13px; color: #666; }}
+  .addresses {{ display: flex; gap: 40px; margin-bottom: 28px; }}
+  .addr-block {{ flex: 1; }}
+  .addr-block h3 {{ font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #888; margin: 0 0 6px 0; }}
+  .addr-block p {{ margin: 2px 0; font-size: 13px; }}
+  table {{ width: 100%; border-collapse: collapse; margin-bottom: 24px; }}
+  th {{ background: #1a3a6b; color: #fff; padding: 10px 12px; text-align: left; font-size: 13px; }}
+  td {{ padding: 10px 12px; border-bottom: 1px solid #e5e5e5; font-size: 13px; }}
+  tr:nth-child(even) td {{ background: #f7f9fc; }}
+  .totals {{ text-align: right; margin-bottom: 28px; }}
+  .totals table {{ width: 260px; margin-left: auto; }}
+  .totals td {{ border: none; padding: 4px 8px; }}
+  .totals .grand-total td {{ font-weight: 700; font-size: 16px; border-top: 2px solid #1a3a6b; padding-top: 8px; }}
+  .footer {{ border-top: 1px solid #ddd; padding-top: 16px; font-size: 12px; color: #666; }}
+  .confirm-note {{ background: #f0f4ff; border-left: 4px solid #1a3a6b; padding: 12px 16px; margin-bottom: 20px; font-size: 13px; }}
+</style>
+</head>
+<body>
+<div class="po-wrap">
+  <div class="header">
+    <div>
+      <div class="store-name">Great Bridge Furniture</div>
+      <div class="store-info">1325 S Battlefield Blvd, Chesapeake, VA 23322<br>Phone: (757) 482-6622 &middot; Est. 1984</div>
+    </div>
+    <div class="po-title">
+      <h1>PURCHASE ORDER</h1>
+      <div class="po-num">PO # {po_number}</div>
+      <div class="po-date">Date: {today}</div>
+    </div>
+  </div>
+
+  <div class="addresses">
+    <div class="addr-block">
+      <h3>Vendor / Manufacturer</h3>
+      <p><strong>{mfr_name}</strong></p>
+      {'<p>' + mfr_contact + '</p>' if mfr_contact else ''}
+      {'<p>' + mfr_address.replace(chr(10), '<br>') + '</p>' if mfr_address else ''}
+      {'<p>' + mfr_email + '</p>' if mfr_email else ''}
+    </div>
+    <div class="addr-block">
+      <h3>Ship To / Bill To</h3>
+      <p><strong>Great Bridge Furniture</strong></p>
+      <p>1325 S Battlefield Blvd</p>
+      <p>Chesapeake, VA 23322</p>
+      <p>(757) 482-6622</p>
+    </div>
+  </div>
+
+  <div class="confirm-note">
+    &#9888;&#65039; Please confirm receipt of this purchase order by replying to this email. Include your order confirmation number and expected ship date.
+  </div>
+
+  <table>
+    <thead>
+      <tr><th>Customer</th><th>Phone</th><th>Items / Description</th><th>Expected Date</th><th>Notes</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>{order.get('customer_name','')}</td>
+        <td>{order.get('phone','')}</td>
+        <td>{order.get('items','')}</td>
+        <td>{order.get('expected_date','')}</td>
+        <td>{order.get('notes','')}</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="totals">
+    <table>
+      <tr><td>Total</td><td><strong>${float(order.get('total_amount') or 0):.2f}</strong></td></tr>
+      <tr><td>Deposit Paid</td><td>${float(order.get('deposit_paid') or 0):.2f}</td></tr>
+      <tr class="grand-total"><td>Balance Due</td><td>${(float(order.get('total_amount') or 0) - float(order.get('deposit_paid') or 0)):.2f}</td></tr>
+    </table>
+  </div>
+
+  <div class="footer">
+    <p>This purchase order constitutes an offer to purchase the items listed above at the terms stated. Please contact us at (757) 482-6622 or reply to this email with any questions.</p>
+    <p style="margin-top:8px;color:#999;">Generated by LightView &middot; Great Bridge Furniture &middot; lightview.win</p>
+  </div>
+</div>
+</body>
+</html>"""
+
 
 # ── AIVM HELPERS ─────────────────────────────────────────────────────────────
 
@@ -451,6 +607,15 @@ def get_aivm():
                     raise RuntimeError("LIGHTCHAIN_PRIVATE_KEY env var not set")
                 _aivm_client = AIVMClient(AIVM_PRIVATE_KEY)
     return _aivm_client
+
+
+def _call_aivm(prompt: str, timeout_secs: int = 180) -> str:
+    """Convenience wrapper: call AIVM and return the text result. Raises on error."""
+    aivm = get_aivm()
+    if not aivm:
+        raise RuntimeError("AIVM not configured")
+    return aivm.run_inference(prompt, timeout_secs=timeout_secs)
+
 
 # ── QB HELPERS ───────────────────────────────────────────────────────────────
 
@@ -3415,6 +3580,189 @@ def gb_proposal(order_id):
 
     from flask import Response
     return Response(full_html, content_type="text/html; charset=utf-8")
+
+
+# ── GREAT BRIDGE FURNITURE — MANUFACTURERS ───────────────────────────────────
+
+@app.route('/api/gb/manufacturers', methods=['GET'])
+def gb_list_manufacturers():
+    conn = _db()
+    rows = conn.execute("SELECT * FROM gb_manufacturers ORDER BY name").fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/gb/manufacturers', methods=['POST'])
+def gb_create_manufacturer():
+    data = request.json or {}
+    conn = _db()
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO gb_manufacturers (name,contact_person,email,phone,fax,address,notes) VALUES (?,?,?,?,?,?,?)",
+        (data.get('name',''), data.get('contact_person',''), data.get('email',''),
+         data.get('phone',''), data.get('fax',''), data.get('address',''), data.get('notes',''))
+    )
+    conn.commit()
+    new_id = c.lastrowid
+    conn.close()
+    return jsonify({'ok': True, 'id': new_id})
+
+
+@app.route('/api/gb/manufacturers/<int:mid>', methods=['PUT'])
+def gb_update_manufacturer(mid):
+    data = request.json or {}
+    conn = _db()
+    conn.execute(
+        "UPDATE gb_manufacturers SET name=?,contact_person=?,email=?,phone=?,fax=?,address=?,notes=? WHERE id=?",
+        (data.get('name',''), data.get('contact_person',''), data.get('email',''),
+         data.get('phone',''), data.get('fax',''), data.get('address',''), data.get('notes',''), mid)
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/gb/manufacturers/<int:mid>', methods=['DELETE'])
+def gb_delete_manufacturer(mid):
+    conn = _db()
+    conn.execute("DELETE FROM gb_manufacturers WHERE id=?", (mid,))
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/gb/manufacturers/import', methods=['POST'])
+def gb_import_manufacturers():
+    """Import manufacturers from a spreadsheet or Word doc using AIVM to extract contact info."""
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file'}), 400
+    f     = request.files['file']
+    raw   = f.read()
+    fname = (f.filename or '').lower()
+
+    text_content = ''
+    try:
+        if fname.endswith('.docx'):
+            from docx import Document as _DocxDoc
+            import io as _io_mfr
+            doc = _DocxDoc(_io_mfr.BytesIO(raw))
+            text_content = '\n'.join(p.text for p in doc.paragraphs if p.text.strip())
+        elif fname.endswith('.xlsx') or fname.endswith('.xls'):
+            import openpyxl as _xl_mfr, io as _io_mfr2
+            wb = _xl_mfr.load_workbook(_io_mfr2.BytesIO(raw), data_only=True)
+            ws = wb.active
+            rows = []
+            for row in ws.iter_rows(values_only=True):
+                row_text = ' | '.join(str(c) for c in row if c is not None)
+                if row_text.strip():
+                    rows.append(row_text)
+            text_content = '\n'.join(rows[:200])
+        elif fname.endswith('.csv'):
+            text_content = raw.decode('utf-8', errors='replace')[:8000]
+        else:
+            text_content = raw.decode('utf-8', errors='replace')[:8000]
+    except Exception as e:
+        return jsonify({'error': f'Could not read file: {e}'}), 400
+
+    prompt = f"""Extract all manufacturer/vendor/supplier contact information from the following text.
+Return a JSON array where each element has these fields:
+- name (company name, required)
+- contact_person (person's name if present, else empty string)
+- email (email address if present, else empty string)
+- phone (phone number if present, else empty string)
+- fax (fax number if present, else empty string)
+- address (mailing/shipping address if present, else empty string)
+- notes (any other relevant info, else empty string)
+
+Return ONLY the JSON array, no other text.
+
+Content to extract from:
+{text_content[:6000]}"""
+
+    manufacturers = []
+    try:
+        aivm_resp = _call_aivm(prompt)
+        import json as _json_mfr, re as _re_mfr
+        match = _re_mfr.search(r'\[.*\]', aivm_resp, _re_mfr.DOTALL)
+        if match:
+            manufacturers = _json_mfr.loads(match.group())
+    except Exception:
+        pass
+
+    return jsonify({'ok': True, 'manufacturers': manufacturers, 'count': len(manufacturers)})
+
+
+@app.route('/api/gb/orders/<int:oid>/send-po', methods=['POST'])
+def gb_send_po(oid):
+    """Generate a PO and email it to the manufacturer."""
+    data      = request.json or {}
+    user_name = data.get('user_name', 'Staff')
+
+    conn  = _db()
+    order = conn.execute("SELECT * FROM gb_orders WHERE id=?", (oid,)).fetchone()
+    if not order:
+        conn.close()
+        return jsonify({'error': 'Order not found'}), 404
+    order = dict(order)
+
+    # Look up manufacturer — try manufacturer_id first, then match by name
+    manufacturer = None
+    if order.get('manufacturer_id'):
+        row = conn.execute("SELECT * FROM gb_manufacturers WHERE id=?", (order['manufacturer_id'],)).fetchone()
+        if row:
+            manufacturer = dict(row)
+    if not manufacturer and order.get('manufacturer'):
+        row = conn.execute("SELECT * FROM gb_manufacturers WHERE name LIKE ?",
+                           (f"%{order['manufacturer']}%",)).fetchone()
+        if row:
+            manufacturer = dict(row)
+
+    to_email = data.get('override_email') or (manufacturer.get('email') if manufacturer else '')
+    if not to_email:
+        conn.close()
+        return jsonify({'error': 'No manufacturer email address found. Please add an email to the manufacturer record or enter one manually.'}), 400
+
+    po_html  = _gen_po_html(order, manufacturer)
+    mfr_name = (manufacturer.get('name') if manufacturer else None) or order.get('manufacturer', 'Manufacturer')
+    subject  = f"Purchase Order - Great Bridge Furniture - {order.get('customer_name', '')} - {order.get('items', '')[:40]}"
+
+    try:
+        _send_aol_email(to_email, subject, po_html)
+    except ValueError as e:
+        conn.close()
+        return jsonify({'error': str(e), 'setup_needed': True}), 400
+    except Exception as e:
+        conn.close()
+        return jsonify({'error': f'Email failed: {str(e)}'}), 500
+
+    import datetime as _dt_po2
+    now = _dt_po2.datetime.now().isoformat(sep=' ', timespec='seconds')
+    conn.execute("UPDATE gb_orders SET po_sent_at=? WHERE id=?", (now, oid))
+    conn.commit()
+    _log_activity(user_name, 'send_po', f'Order #{oid}', f'PO emailed to {to_email} ({mfr_name})')
+    conn.close()
+
+    return jsonify({'ok': True, 'sent_to': to_email, 'manufacturer': mfr_name})
+
+
+@app.route('/api/gb/orders/<int:oid>/po-preview')
+def gb_po_preview(oid):
+    """Return the PO as a printable HTML page (opens in new tab)."""
+    conn  = _db()
+    order = conn.execute("SELECT * FROM gb_orders WHERE id=?", (oid,)).fetchone()
+    if not order:
+        conn.close()
+        return "Order not found", 404
+    order        = dict(order)
+    manufacturer = None
+    if order.get('manufacturer_id'):
+        row = conn.execute("SELECT * FROM gb_manufacturers WHERE id=?", (order['manufacturer_id'],)).fetchone()
+        if row:
+            manufacturer = dict(row)
+    conn.close()
+    html = _gen_po_html(order, manufacturer)
+    html = html.replace('</body>', '<script>window.onload=function(){window.print();}</script></body>')
+    return html, 200, {'Content-Type': 'text/html; charset=utf-8'}
 
 
 # ── MAIN ─────────────────────────────────────────────────────────────────────
