@@ -256,6 +256,41 @@ def _init_db():
         try: c.execute("ALTER TABLE biz_profile ADD COLUMN company_id INTEGER DEFAULT 1")
         except: pass
 
+        # ── Session 126: Scanned PO tables ───────────────────────────────────
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS scanned_pos (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                manufacturer       TEXT    DEFAULT '',
+                po_number          TEXT    DEFAULT '',
+                order_date         TEXT    DEFAULT '',
+                account_number     TEXT    DEFAULT '',
+                date_required      TEXT    DEFAULT '',
+                submitted_by       TEXT    DEFAULT '',
+                submitted_date     TEXT    DEFAULT '',
+                acknowledged_date  TEXT    DEFAULT '',
+                image_data         BLOB,
+                image_type         TEXT    DEFAULT 'image/jpeg',
+                image_filename     TEXT    DEFAULT 'po.jpg',
+                notes              TEXT    DEFAULT '',
+                company_id         INTEGER DEFAULT 1,
+                created_at         TEXT    DEFAULT (datetime('now'))
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS scanned_po_items (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                po_id        INTEGER NOT NULL REFERENCES scanned_pos(id) ON DELETE CASCADE,
+                qty          TEXT    DEFAULT '',
+                description  TEXT    DEFAULT '',
+                item_number  TEXT    DEFAULT '',
+                back_style   TEXT    DEFAULT '',
+                seat_back_top TEXT   DEFAULT '',
+                frame        TEXT    DEFAULT '',
+                tag          TEXT    DEFAULT '',
+                item_notes   TEXT    DEFAULT ''
+            )
+        """)
+
         conn.commit()
 
 try:
@@ -3968,6 +4003,425 @@ def gb_po_preview(oid):
     html = _gen_po_html(order, manufacturer)
     html = html.replace('</body>', '<script>window.onload=function(){window.print();}</script></body>')
     return html, 200, {'Content-Type': 'text/html; charset=utf-8'}
+
+
+# ── SCANNED PURCHASE ORDERS (Session 126) ────────────────────────────────────
+
+def _extract_po_fields(raw_bytes, mime):
+    """
+    Send a PO image to AIVM and extract all header + line item fields.
+    Returns dict: { manufacturer, po_number, order_date, account_number,
+                    date_required, submitted_by, submitted_date, acknowledged_date,
+                    items: [{qty, description, item_number, back_style,
+                             seat_back_top, frame, tag, item_notes}] }
+    """
+    b64_data = _b64_mod.b64encode(raw_bytes).decode()
+    prompt = (
+        "This is a photo or scan of a handwritten furniture Purchase Order form from Great Bridge Furniture. "
+        "Extract all visible information and return ONLY valid JSON with exactly these keys:\n"
+        "{\n"
+        '  "manufacturer": "",\n'
+        '  "po_number": "",\n'
+        '  "order_date": "",\n'
+        '  "account_number": "",\n'
+        '  "date_required": "",\n'
+        '  "submitted_by": "",\n'
+        '  "submitted_date": "",\n'
+        '  "acknowledged_date": "",\n'
+        '  "items": [\n'
+        '    {\n'
+        '      "qty": "",\n'
+        '      "description": "",\n'
+        '      "item_number": "",\n'
+        '      "back_style": "",\n'
+        '      "seat_back_top": "",\n'
+        '      "frame": "",\n'
+        '      "tag": "",\n'
+        '      "item_notes": ""\n'
+        '    }\n'
+        '  ]\n'
+        "}\n\n"
+        "IMPORTANT: The 'tag' column is the customer's LAST NAME. "
+        "Include one item object per line on the form. "
+        "Any continuation notes below a line item (e.g. 'w/ cup holder') go into item_notes for that item. "
+        "If a field is blank or unreadable, use empty string. "
+        "Return ONLY the JSON object, no markdown, no explanation.\n\n"
+        f"[Image attached as base64 {mime}: {b64_data[:60]}... (use actual image data)]"
+    )
+    aivm   = get_aivm()
+    result = aivm.run_inference(prompt, timeout_secs=180)
+    cleaned = _re_mod.sub(r"```(?:json)?", "", result).strip().strip("`").strip()
+    match = _re_mod.search(r"\{.*\}", cleaned, _re_mod.DOTALL)
+    extracted = json.loads(match.group() if match else cleaned)
+    # Ensure items is a list
+    if not isinstance(extracted.get("items"), list):
+        extracted["items"] = []
+    return extracted
+
+
+@app.route("/api/gb/scan-po", methods=["POST"])
+def gb_scan_po():
+    """Upload a PO image, extract fields with AIVM, return JSON (no save yet)."""
+    if "image" not in request.files:
+        return jsonify({"error": "No image file uploaded"}), 400
+    img_file = request.files["image"]
+    try:
+        raw  = img_file.read()
+        mime = img_file.content_type or "image/jpeg"
+    except Exception as e:
+        return jsonify({"error": f"Could not read image: {e}"}), 400
+    try:
+        fields = _extract_po_fields(raw, mime)
+    except Exception as e:
+        print(f"[gb/scan-po] AIVM error: {e}")
+        return jsonify({"error": f"Could not extract PO data: {e}"}), 500
+    return jsonify({"fields": fields})
+
+
+@app.route("/api/gb/scanned-pos", methods=["GET"])
+def gb_list_scanned_pos():
+    """List all scanned POs, optional ?manufacturer=&search= filters."""
+    manufacturer = request.args.get("manufacturer", "").strip()
+    search       = request.args.get("search", "").strip()
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT id, manufacturer, po_number, order_date, date_required, "
+            "submitted_date, image_filename, created_at FROM scanned_pos "
+            "WHERE company_id=1 ORDER BY created_at DESC"
+        ).fetchall()
+    pos = [dict(r) for r in rows]
+    if manufacturer:
+        pos = [p for p in pos if manufacturer.lower() in (p.get("manufacturer") or "").lower()]
+    if search:
+        s = search.lower()
+        pos = [p for p in pos if s in (p.get("manufacturer") or "").lower()
+               or s in (p.get("po_number") or "").lower()]
+    # Attach items + customer tags to each
+    result = []
+    with _db() as conn:
+        for p in pos:
+            items = conn.execute(
+                "SELECT qty, description, tag FROM scanned_po_items WHERE po_id=? ORDER BY id",
+                (p["id"],)
+            ).fetchall()
+            p["items"]     = [dict(i) for i in items]
+            p["tags"]      = list({i["tag"] for i in p["items"] if i["tag"]})
+            result.append(p)
+    return jsonify({"pos": result})
+
+
+@app.route("/api/gb/scanned-pos", methods=["POST"])
+def gb_save_scanned_po():
+    """
+    Save a scanned PO with its image + extracted items.
+    Accepts multipart/form-data:
+      image       - file (optional if re-saving)
+      data        - JSON string with header fields + items array
+    """
+    data_str = request.form.get("data", "{}")
+    try:
+        data = json.loads(data_str)
+    except Exception:
+        return jsonify({"error": "Invalid JSON in data field"}), 400
+
+    image_data     = None
+    image_type     = "image/jpeg"
+    image_filename = "po.jpg"
+    if "image" in request.files:
+        f = request.files["image"]
+        image_data     = f.read()
+        image_type     = f.content_type or "image/jpeg"
+        image_filename = f.filename or "po.jpg"
+
+    with _db() as conn:
+        cur = conn.execute(
+            """INSERT INTO scanned_pos
+               (manufacturer, po_number, order_date, account_number, date_required,
+                submitted_by, submitted_date, acknowledged_date,
+                image_data, image_type, image_filename, notes, company_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)""",
+            (
+                data.get("manufacturer", ""),
+                data.get("po_number", ""),
+                data.get("order_date", ""),
+                data.get("account_number", ""),
+                data.get("date_required", ""),
+                data.get("submitted_by", ""),
+                data.get("submitted_date", ""),
+                data.get("acknowledged_date", ""),
+                image_data,
+                image_type,
+                image_filename,
+                data.get("notes", ""),
+            )
+        )
+        po_id = cur.lastrowid
+        for item in data.get("items", []):
+            conn.execute(
+                """INSERT INTO scanned_po_items
+                   (po_id, qty, description, item_number, back_style,
+                    seat_back_top, frame, tag, item_notes)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (
+                    po_id,
+                    item.get("qty", ""),
+                    item.get("description", ""),
+                    item.get("item_number", ""),
+                    item.get("back_style", ""),
+                    item.get("seat_back_top", ""),
+                    item.get("frame", ""),
+                    item.get("tag", ""),
+                    item.get("item_notes", ""),
+                )
+            )
+        conn.commit()
+    _log_activity(request.form.get("user", "David"), "Saved Scanned PO",
+                  f"PO #{data.get('po_number','?')}", data.get("manufacturer", ""))
+    return jsonify({"id": po_id, "success": True})
+
+
+@app.route("/api/gb/scanned-pos/<int:po_id>", methods=["GET"])
+def gb_get_scanned_po(po_id):
+    """Get one scanned PO with full items + linked customer orders."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT id, manufacturer, po_number, order_date, account_number, date_required, "
+            "submitted_by, submitted_date, acknowledged_date, image_type, image_filename, "
+            "notes, created_at FROM scanned_pos WHERE id=? AND company_id=1",
+            (po_id,)
+        ).fetchone()
+        if not row:
+            return jsonify({"error": "PO not found"}), 404
+        po    = dict(row)
+        items = conn.execute(
+            "SELECT * FROM scanned_po_items WHERE po_id=? ORDER BY id", (po_id,)
+        ).fetchall()
+        po["items"] = [dict(i) for i in items]
+        # Link customer orders by tag (last name match)
+        linked = []
+        tags = {i["tag"].strip().lower() for i in po["items"] if i.get("tag", "").strip()}
+        if tags:
+            all_orders = conn.execute(
+                "SELECT id, customer_name, status, items, expected_date, total_amount, deposit_paid "
+                "FROM orders WHERE company_id=1"
+            ).fetchall()
+            for o in all_orders:
+                o = dict(o)
+                name_lower = (o.get("customer_name") or "").lower()
+                for t in tags:
+                    if t and t in name_lower:
+                        o["matched_tag"] = t.title()
+                        linked.append(o)
+                        break
+        po["linked_orders"] = linked
+    return jsonify({"po": po})
+
+
+@app.route("/api/gb/scanned-pos/<int:po_id>", methods=["DELETE"])
+def gb_delete_scanned_po(po_id):
+    """Delete a scanned PO and its items."""
+    with _db() as conn:
+        row = conn.execute("SELECT po_number, manufacturer FROM scanned_pos WHERE id=?", (po_id,)).fetchone()
+        if not row:
+            return jsonify({"error": "PO not found"}), 404
+        conn.execute("DELETE FROM scanned_po_items WHERE po_id=?", (po_id,))
+        conn.execute("DELETE FROM scanned_pos WHERE id=?", (po_id,))
+        conn.commit()
+    _log_activity("David", "Deleted Scanned PO", f"PO #{row['po_number']}", row["manufacturer"])
+    return jsonify({"success": True})
+
+
+@app.route("/api/gb/scanned-pos/<int:po_id>/image", methods=["GET"])
+def gb_scanned_po_image(po_id):
+    """Serve the original PO image."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT image_data, image_type, image_filename FROM scanned_pos WHERE id=? AND company_id=1",
+            (po_id,)
+        ).fetchone()
+    if not row or not row["image_data"]:
+        return "Image not found", 404
+    from flask import Response as _FlaskResp
+    return _FlaskResp(
+        row["image_data"],
+        mimetype=row["image_type"] or "image/jpeg",
+        headers={"Content-Disposition": f'inline; filename="{row["image_filename"]}"'}
+    )
+
+
+@app.route("/api/gb/scanned-pos/<int:po_id>/digital", methods=["GET"])
+def gb_scanned_po_digital(po_id):
+    """Generate a clean digital HTML version of a scanned PO for printing or emailing."""
+    import datetime as _dt_spo
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT * FROM scanned_pos WHERE id=? AND company_id=1", (po_id,)
+        ).fetchone()
+        if not row:
+            return "PO not found", 404
+        po    = dict(row)
+        items = conn.execute(
+            "SELECT * FROM scanned_po_items WHERE po_id=? ORDER BY id", (po_id,)
+        ).fetchall()
+        po["items"] = [dict(i) for i in items]
+
+    rows_html = ""
+    for item in po["items"]:
+        notes_cell = f'<br><small style="color:#666">{item["item_notes"]}</small>' if item.get("item_notes") else ""
+        rows_html += f"""
+        <tr>
+          <td>{item.get('qty','')}</td>
+          <td>{item.get('description','')}{notes_cell}</td>
+          <td>{item.get('item_number','')}</td>
+          <td>{item.get('back_style','')}</td>
+          <td>{item.get('seat_back_top','')}</td>
+          <td>{item.get('frame','')}</td>
+          <td style="font-weight:600">{item.get('tag','')}</td>
+        </tr>"""
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Purchase Order — {po.get('manufacturer','')}</title>
+<style>
+  body{{font-family:Arial,sans-serif;margin:0;padding:24px;font-size:14px;color:#111}}
+  .header{{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:20px;border-bottom:3px solid #1a3a5c;padding-bottom:16px}}
+  .gbf-info h1{{margin:0 0 4px;font-size:22px;color:#1a3a5c}}
+  .gbf-info p{{margin:2px 0;font-size:12px;color:#555}}
+  .po-box{{background:#f5f8fc;border:1px solid #cdd9e8;border-radius:6px;padding:12px 16px;min-width:260px}}
+  .po-box table{{border-collapse:collapse;width:100%}}
+  .po-box td{{padding:3px 8px;font-size:13px}}
+  .po-box td:first-child{{font-weight:600;color:#1a3a5c;white-space:nowrap}}
+  table.items{{width:100%;border-collapse:collapse;margin-top:16px}}
+  table.items th{{background:#1a3a5c;color:#fff;padding:8px 10px;text-align:left;font-size:13px}}
+  table.items td{{padding:8px 10px;border-bottom:1px solid #e0e8f0;font-size:13px;vertical-align:top}}
+  table.items tr:nth-child(even){{background:#f5f8fc}}
+  .footer{{margin-top:24px;padding-top:12px;border-top:1px solid #cdd9e8;display:flex;justify-content:space-between;font-size:12px;color:#555}}
+  @media print{{body{{padding:10px}}.no-print{{display:none}}}}
+</style>
+</head>
+<body>
+<div class="no-print" style="text-align:right;margin-bottom:12px">
+  <button onclick="window.print()" style="background:#1a3a5c;color:#fff;border:none;padding:10px 20px;border-radius:6px;font-size:14px;cursor:pointer">🖨️ Print / Save PDF</button>
+</div>
+<div class="header">
+  <div class="gbf-info">
+    <h1>Great Bridge Furniture</h1>
+    <p>1325 S Battlefield Blvd, Chesapeake, VA 23322</p>
+    <p>Phone: 757-482-6622 &nbsp;|&nbsp; Fax: 757-482-0711</p>
+    <p>Email: gbfdavid@aol.com</p>
+  </div>
+  <div class="po-box">
+    <table>
+      <tr><td>Manufacturer:</td><td><strong>{po.get('manufacturer','')}</strong></td></tr>
+      <tr><td>PO Number:</td><td>{po.get('po_number','')}</td></tr>
+      <tr><td>Order Date:</td><td>{po.get('order_date','')}</td></tr>
+      <tr><td>Account #:</td><td>{po.get('account_number','')}</td></tr>
+      <tr><td>Date Required:</td><td><strong>{po.get('date_required','')}</strong></td></tr>
+    </table>
+  </div>
+</div>
+<table class="items">
+  <thead>
+    <tr>
+      <th>QTY</th><th>Description</th><th>Item #</th>
+      <th>Back Style</th><th>Seat/Back/Top</th><th>Frame</th><th>Tag</th>
+    </tr>
+  </thead>
+  <tbody>{rows_html}</tbody>
+</table>
+<div class="footer">
+  <div>Submitted by: <strong>{po.get('submitted_by','')}</strong> &nbsp; Date: {po.get('submitted_date','')}</div>
+  <div>Acknowledged: {po.get('acknowledged_date','')}</div>
+  <div>Generated by LightView on {_dt_spo.date.today().strftime('%B %d, %Y')}</div>
+</div>
+</body>
+</html>"""
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+@app.route("/api/gb/scanned-pos/<int:po_id>/email", methods=["POST"])
+def gb_email_scanned_po(po_id):
+    """Email the digital PO to the manufacturer's email address."""
+    body = request.get_json(silent=True) or {}
+    to_email = body.get("to_email", "").strip()
+    if not to_email:
+        return jsonify({"error": "to_email is required"}), 400
+
+    # Generate the HTML
+    import datetime as _dt_epo
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT * FROM scanned_pos WHERE id=? AND company_id=1", (po_id,)
+        ).fetchone()
+        if not row:
+            return jsonify({"error": "PO not found"}), 404
+        po    = dict(row)
+        items = conn.execute(
+            "SELECT * FROM scanned_po_items WHERE po_id=? ORDER BY id", (po_id,)
+        ).fetchall()
+        po["items"] = [dict(i) for i in items]
+
+    # Build simple email HTML (inline styles for email clients)
+    rows_html = ""
+    for item in po["items"]:
+        notes_cell = f'<br><small style="color:#666">{item["item_notes"]}</small>' if item.get("item_notes") else ""
+        rows_html += (
+            f'<tr>'
+            f'<td style="padding:6px 10px;border-bottom:1px solid #e0e8f0">{item.get("qty","")}</td>'
+            f'<td style="padding:6px 10px;border-bottom:1px solid #e0e8f0">{item.get("description","")}{notes_cell}</td>'
+            f'<td style="padding:6px 10px;border-bottom:1px solid #e0e8f0">{item.get("item_number","")}</td>'
+            f'<td style="padding:6px 10px;border-bottom:1px solid #e0e8f0">{item.get("back_style","")}</td>'
+            f'<td style="padding:6px 10px;border-bottom:1px solid #e0e8f0">{item.get("seat_back_top","")}</td>'
+            f'<td style="padding:6px 10px;border-bottom:1px solid #e0e8f0">{item.get("frame","")}</td>'
+            f'<td style="padding:6px 10px;border-bottom:1px solid #e0e8f0;font-weight:600">{item.get("tag","")}</td>'
+            f'</tr>'
+        )
+
+    email_html = f"""
+<div style="font-family:Arial,sans-serif;max-width:700px;margin:0 auto;color:#111">
+  <div style="background:#1a3a5c;color:#fff;padding:20px 24px;border-radius:8px 8px 0 0">
+    <h2 style="margin:0 0 4px">Great Bridge Furniture</h2>
+    <p style="margin:0;font-size:13px;opacity:.85">1325 S Battlefield Blvd, Chesapeake, VA 23322 | 757-482-6622</p>
+  </div>
+  <div style="background:#f5f8fc;border:1px solid #cdd9e8;padding:16px 24px">
+    <table style="border-collapse:collapse;width:100%">
+      <tr><td style="padding:3px 8px;font-weight:600;color:#1a3a5c">Manufacturer:</td><td style="padding:3px 8px">{po.get('manufacturer','')}</td></tr>
+      <tr><td style="padding:3px 8px;font-weight:600;color:#1a3a5c">PO Number:</td><td style="padding:3px 8px">{po.get('po_number','')}</td></tr>
+      <tr><td style="padding:3px 8px;font-weight:600;color:#1a3a5c">Order Date:</td><td style="padding:3px 8px">{po.get('order_date','')}</td></tr>
+      <tr><td style="padding:3px 8px;font-weight:600;color:#1a3a5c">Account #:</td><td style="padding:3px 8px">{po.get('account_number','')}</td></tr>
+      <tr><td style="padding:3px 8px;font-weight:600;color:#1a3a5c">Date Required:</td><td style="padding:3px 8px"><strong>{po.get('date_required','')}</strong></td></tr>
+    </table>
+  </div>
+  <table style="width:100%;border-collapse:collapse;margin-top:0">
+    <thead>
+      <tr style="background:#2c5282;color:#fff">
+        <th style="padding:8px 10px;text-align:left;font-size:13px">QTY</th>
+        <th style="padding:8px 10px;text-align:left;font-size:13px">Description</th>
+        <th style="padding:8px 10px;text-align:left;font-size:13px">Item #</th>
+        <th style="padding:8px 10px;text-align:left;font-size:13px">Back Style</th>
+        <th style="padding:8px 10px;text-align:left;font-size:13px">Seat/Back/Top</th>
+        <th style="padding:8px 10px;text-align:left;font-size:13px">Frame</th>
+        <th style="padding:8px 10px;text-align:left;font-size:13px">Tag</th>
+      </tr>
+    </thead>
+    <tbody>{rows_html}</tbody>
+  </table>
+  <div style="padding:16px 24px;background:#fff;border:1px solid #cdd9e8;border-top:none;border-radius:0 0 8px 8px;font-size:12px;color:#555">
+    Submitted by: <strong>{po.get('submitted_by','')}</strong> &nbsp;|&nbsp;
+    Date: {po.get('submitted_date','')} &nbsp;|&nbsp;
+    Sent via LightView on {_dt_epo.date.today().strftime('%B %d, %Y')}
+  </div>
+</div>"""
+
+    subject = f"Purchase Order — {po.get('manufacturer','')} | GBF PO #{po.get('po_number','')}"
+    try:
+        _send_aol_email(to_email, subject, email_html)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    _log_activity("David", "Emailed Scanned PO", f"PO #{po.get('po_number','?')}", f"To: {to_email}")
+    return jsonify({"success": True, "to": to_email})
 
 
 # ── MAIN ─────────────────────────────────────────────────────────────────────
