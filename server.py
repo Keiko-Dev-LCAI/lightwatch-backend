@@ -72,6 +72,19 @@ def _db():
     conn.row_factory = sqlite3.Row
     return conn
 
+def _resolve_company_id():
+    """Get company_id from request. Uses company_slug param if provided, defaults to GBF (id=1)."""
+    slug = request.args.get('company_slug', '').strip()
+    if slug and slug != 'gbf':
+        try:
+            with _db() as conn:
+                co = conn.execute("SELECT id FROM companies WHERE slug=?", (slug,)).fetchone()
+                if co:
+                    return co[0]
+        except Exception:
+            pass
+    return 1  # Default to GBF for backward compatibility
+
 def _init_db():
     with _db() as conn:
         c = conn
@@ -1303,12 +1316,13 @@ Keep responses short and warm. No jargon."""
 
 @app.route("/api/gb/orders", methods=["GET"])
 def gb_get_orders():
-    """Return all orders sorted: Ready for Pickup first, then Ordered, In Transit, etc."""
+    """Return all orders for the requesting company, sorted by status priority."""
     try:
         _init_db()
+        company_id = _resolve_company_id()
         with _db() as conn:
             rows = conn.execute(
-                "SELECT * FROM orders ORDER BY "
+                "SELECT * FROM orders WHERE company_id=? ORDER BY "
                 "CASE status "
                 "  WHEN 'Ready for Pickup' THEN 1 "
                 "  WHEN 'Ordered'          THEN 2 "
@@ -1316,7 +1330,8 @@ def gb_get_orders():
                 "  WHEN 'Received'         THEN 4 "
                 "  WHEN 'Delivered'        THEN 5 "
                 "  WHEN 'Paid'             THEN 6 "
-                "  ELSE 7 END, created_at DESC"
+                "  ELSE 7 END, created_at DESC",
+                (company_id,)
             ).fetchall()
         return jsonify({"orders": [dict(r) for r in rows]})
     except Exception as e:
@@ -1334,12 +1349,14 @@ def gb_create_order():
         items = data.get("items", [])
         items_str = json.dumps(items) if isinstance(items, list) else str(items)
         customer  = str(data.get("customer_name") or "Unknown")[:200]
+        company_id = _resolve_company_id()
         with _db() as conn:
             cur = conn.execute(
                 "INSERT INTO orders "
-                "(customer_name, phone, items, manufacturer, total_amount, deposit_paid, expected_date, delivery_date, status, notes) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (customer,
+                "(company_id, customer_name, phone, items, manufacturer, total_amount, deposit_paid, expected_date, delivery_date, status, notes) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (company_id,
+                 customer,
                  str(data.get("phone") or "")[:50],
                  items_str,
                  str(data.get("manufacturer") or "")[:200],
