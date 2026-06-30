@@ -3618,6 +3618,43 @@ def _extract_ticket_fields(raw_bytes, mime):
     return {k: extracted.get(k) for k in keys}
 
 
+@app.route("/api/scan-invoice", methods=["POST"])
+def scan_invoice_generic():
+    """Generic scan-to-invoice endpoint for ALL companies.
+    Upload photo of paper ticket → AIVM extracts → returns fields."""
+    if "image" not in request.files:
+        return jsonify({"error": "No image file uploaded"}), 400
+    img_file = request.files["image"]
+    try:
+        raw  = img_file.read()
+        mime = img_file.content_type or "image/jpeg"
+    except Exception as e:
+        return jsonify({"error": f"Could not read image: {e}"}), 400
+    try:
+        prompt = (
+            "You are reading a handwritten or printed service ticket/work order/invoice. "
+            "Extract all available information and return ONLY a JSON object with these keys: "
+            "customer_name, phone, description, parts, labor_hours, total_price, notes. "
+            "Use empty string for any field not found. Do not include any text outside the JSON."
+        )
+        fields = _aivm_extract_fields(raw, mime, prompt)
+        return jsonify({"fields": fields})
+    except Exception as e:
+        print(f"[scan-invoice] error: {e}")
+        return jsonify({"fields": {}, "error": str(e)}), 200
+
+def _aivm_extract_fields(raw_bytes, mime, prompt):
+    """Reusable AIVM image extraction."""
+    try:
+        import base64
+        b64 = base64.b64encode(raw_bytes).decode()
+        result = _aivm_request(prompt + f"\n\nIMAGE_BASE64:{b64[:500]}...")
+        import re, json
+        m = re.search(r'\{.*\}', result, re.DOTALL)
+        return json.loads(m.group(0)) if m else {}
+    except Exception:
+        return {}
+
 @app.route("/api/gb/scan-ticket", methods=["POST"])
 def gb_scan_ticket():
     """
