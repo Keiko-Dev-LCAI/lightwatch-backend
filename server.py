@@ -94,6 +94,10 @@ def _init_db():
         c.execute("""INSERT OR IGNORE INTO companies (id,name,slug,pin,business_type,address,phone,logo_emoji)
         VALUES (99,'LightView Demo','demo','1234','retail',
         '123 Main St, Anytown USA','555-000-0000','⚡')""")
+        # Disperato — Keiko's Italian friend
+        c.execute("""INSERT OR IGNORE INTO companies (id,name,slug,pin,business_type,address,phone,logo_emoji)
+        VALUES (2,'Disperato','disperato','0000','field_service',
+        '','','🔧')""")
 
         # ── Features per company ──────────────────────────────────────────────
         c.execute("""CREATE TABLE IF NOT EXISTS company_features (
@@ -1100,6 +1104,52 @@ def auth_pin():
     return jsonify({"ok": False, "success": False}), 401
 
 # ── Contact / Demo Request ───────────────────────────────────────────────────
+@app.route("/api/company/settings", methods=["GET"])
+def get_company_settings():
+    """Get company settings by slug. Body: { slug: str }"""
+    slug = request.args.get('slug', '').strip()
+    if not slug:
+        return jsonify({"error": "slug required"}), 400
+    with _db() as conn:
+        co = conn.execute(
+            "SELECT id,name,slug,business_type,address,phone,logo_emoji FROM companies WHERE slug=?", (slug,)
+        ).fetchone()
+    if not co:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({"ok": True, "company": {
+        "id": co[0], "name": co[1], "slug": co[2],
+        "business_type": co[3], "address": co[4], "phone": co[5], "emoji": co[6]
+    }})
+
+@app.route("/api/company/settings", methods=["PUT"])
+def update_company_settings():
+    """Update company settings. Body: { slug, pin_verify, name, address, phone, emoji, business_type, new_pin }"""
+    data = request.get_json(force=True) or {}
+    slug       = str(data.get('slug', '')).strip()
+    pin_verify = str(data.get('pin_verify', '')).strip()
+    if not slug or not pin_verify:
+        return jsonify({"ok": False, "error": "slug and pin_verify required"}), 400
+    with _db() as conn:
+        co = conn.execute("SELECT id,pin FROM companies WHERE slug=?", (slug,)).fetchone()
+        if not co:
+            return jsonify({"ok": False, "error": "Company not found"}), 404
+        if co[1] != pin_verify:
+            return jsonify({"ok": False, "error": "Incorrect PIN"}), 401
+        # Build update
+        fields, vals = [], []
+        for col in ['name','address','phone','logo_emoji','business_type']:
+            key = 'emoji' if col == 'logo_emoji' else col
+            if key in data and str(data[key]).strip():
+                fields.append(f"{col}=?")
+                vals.append(str(data[key]).strip()[:200])
+        if 'new_pin' in data and str(data['new_pin']).strip():
+            fields.append("pin=?")
+            vals.append(str(data['new_pin']).strip()[:20])
+        if fields:
+            vals.append(co[0])
+            conn.execute(f"UPDATE companies SET {','.join(fields)} WHERE id=?", vals)
+    return jsonify({"ok": True})
+
 @app.route("/api/contact", methods=["POST"])
 def contact():
     """
