@@ -90,6 +90,10 @@ def _init_db():
         c.execute("""INSERT OR IGNORE INTO companies (id,name,slug,pin,business_type,address,phone,logo_emoji)
         VALUES (1,'Great Bridge Furniture','gbf','8300','furniture_retail',
         '1325 S Battlefield Blvd, Chesapeake VA 23322','757-482-6622','🛋️')""")
+        # Demo company — PIN 1234 — shows app without any client data
+        c.execute("""INSERT OR IGNORE INTO companies (id,name,slug,pin,business_type,address,phone,logo_emoji)
+        VALUES (99,'LightView Demo','demo','1234','retail',
+        '123 Main St, Anytown USA','555-000-0000','⚡')""")
 
         # ── Features per company ──────────────────────────────────────────────
         c.execute("""CREATE TABLE IF NOT EXISTS company_features (
@@ -1081,7 +1085,8 @@ def auth_pin():
         if company:
             return jsonify({"ok": True, "success": True, "company": {
                 "id": company[0], "name": company[1], "slug": company[2],
-                "emoji": company[3], "type": company[4]
+                "emoji": company[3], "type": company[4],
+                "demo_mode": company[2] == "demo"
             }})
     except Exception as _ae:
         print(f"[auth] DB lookup error: {_ae}")
